@@ -1,0 +1,23 @@
+[package]
+name = "mdview"
+version = "0.1.0"
+edition = "2021"
+description = "A less-style terminal pager that renders markdown readably"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+# use-dev-tty: kqueue cannot poll /dev/tty on macOS, which breaks reading
+# keys while stdin is a pipe (`cat foo.md | mdview`); the select()-based
+# event source handles it.
+crossterm = { version = "0.29", features = ["use-dev-tty", "libc"] }
+dirs = "6"
+pulldown-cmark = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+syntect = "5"
+toml = "0.8"
+unicode-width = "0.2"
+
+[profile.release]
+lto = true
+strip = true
