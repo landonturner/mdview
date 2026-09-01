@@ -184,7 +184,18 @@ fn replace_shortcodes(text: &str) -> String {
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'));
             if valid {
                 if let Some(emoji) = emojis::get_by_shortcode(candidate) {
-                    out.push_str(emoji.as_str());
+                    let s = emoji.as_str();
+                    out.push_str(s);
+                    // BMP symbols like ⚡ (U+26A1) and ✨ (U+2728) default to
+                    // text presentation in some terminal font stacks — a thin
+                    // monochrome glyph, or worse. VS16 forces the emoji
+                    // presentation the width accounting already assumes.
+                    let mut chars = s.chars();
+                    if let (Some(first), None) = (chars.next(), chars.next()) {
+                        if (first as u32) < 0x1F000 && first != '\u{FE0F}' {
+                            out.push('\u{FE0F}');
+                        }
+                    }
                     rest = &after[end + 1..];
                     continue;
                 }
@@ -589,7 +600,8 @@ impl<'a> Renderer<'a> {
 
     /// Emits an image as kitty Unicode-placeholder cells when the terminal
     /// supports the graphics protocol; otherwise as a "🖼 alt" hyperlink.
-    fn emit_image(&mut self, cap: ImageCapture) {
+    fn emit_image(&mut self, mut cap: ImageCapture) {
+        cap.alt = replace_shortcodes(&clean_inline(&cap.alt));
         match self.prepare_kitty_image(&cap.url) {
             Some((id, cols, rows)) => {
                 self.flush_inline();
@@ -1047,6 +1059,9 @@ mod tests {
     #[test]
     fn expands_emoji_shortcodes_in_prose_but_not_code() {
         assert_eq!(replace_shortcodes("I :book: it :tada:"), "I 📖 it 🎉");
+        // BMP symbols get VS16 appended to force emoji presentation.
+        assert_eq!(replace_shortcodes(":zap:"), "\u{26A1}\u{FE0F}");
+        assert_eq!(replace_shortcodes(":sparkles:"), "\u{2728}\u{FE0F}");
         assert_eq!(replace_shortcodes(":notarealemoji: stays"), ":notarealemoji: stays");
         assert_eq!(replace_shortcodes("meet at 12:30:45"), "meet at 12:30:45");
         assert_eq!(replace_shortcodes("a : b :tada:"), "a : b 🎉");
