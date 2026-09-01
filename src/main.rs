@@ -1,4 +1,5 @@
 mod config;
+mod diagram;
 mod kitty;
 mod pager;
 mod render;
@@ -21,12 +22,14 @@ Options:
   -d, --dump            Print the rendered document to stdout and exit
   -c, --config          Open the config file in $EDITOR (creating it with
                         defaults first if needed)
+      --clear-cache     Delete the rendered-diagram cache (mermaid/LaTeX)
   -h, --help            Show this help
   -V, --version         Show version
 
 Config file: ~/.config/mdview/config.toml
   wrap_width = 80
   code_theme = \"base16-ocean.dark\"
+  default_view = \"rendered\"   # or \"text\": show diagram blocks as source
 
 Press h inside the pager for key bindings.";
 
@@ -35,10 +38,12 @@ struct Args {
     width: Option<usize>,
     dump: bool,
     config: bool,
+    clear_cache: bool,
 }
 
 fn parse_args() -> Result<Args> {
-    let mut args = Args { file: None, width: None, dump: false, config: false };
+    let mut args =
+        Args { file: None, width: None, dump: false, config: false, clear_cache: false };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -52,6 +57,7 @@ fn parse_args() -> Result<Args> {
             }
             "-d" | "--dump" => args.dump = true,
             "-c" | "--config" => args.config = true,
+            "--clear-cache" => args.clear_cache = true,
             "-w" | "--width" => {
                 let v = it.next().context("--width requires a value")?;
                 args.width = Some(v.parse().context("--width must be a number")?);
@@ -74,6 +80,14 @@ fn parse_args() -> Result<Args> {
 fn main() -> Result<()> {
     let args = parse_args()?;
     let mut cfg = config::load();
+
+    if args.clear_cache {
+        match diagram::clear_cache()? {
+            Some(dir) => println!("removed {}", dir.display()),
+            None => println!("diagram cache is already empty"),
+        }
+        return Ok(());
+    }
 
     if args.config {
         return run_config();
@@ -112,7 +126,8 @@ fn main() -> Result<()> {
     let hl = render::Highlighter::new(&cfg.code_theme);
 
     if args.dump || !std::io::stdout().is_terminal() {
-        let doc = render::render(&source, cfg.wrap_width, &hl, base, render::ImageMode::None);
+        let doc =
+            render::render(&source, cfg.wrap_width, &hl, base, render::ImageMode::None, true);
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         for line in &doc.lines {
             if args.dump {

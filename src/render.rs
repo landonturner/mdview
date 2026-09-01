@@ -72,6 +72,7 @@ pub fn render(
     hl: &Highlighter,
     base: Option<&Path>,
     image_mode: ImageMode,
+    diagrams: bool,
 ) -> Document {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -85,6 +86,7 @@ pub fn render(
         hl,
         base,
         image_mode,
+        diagrams,
         images: Vec::new(),
         lines: Vec::new(),
         headings: Vec::new(),
@@ -139,6 +141,8 @@ struct Renderer<'a> {
     /// Directory the markdown file lives in; resolves relative image paths.
     base: Option<&'a Path>,
     image_mode: ImageMode,
+    /// When false, mermaid/latex blocks stay syntax-highlighted code.
+    diagrams: bool,
     images: Vec<KittyImage>,
     lines: Vec<Line>,
     headings: Vec<Heading>,
@@ -156,6 +160,15 @@ struct Renderer<'a> {
 /// advances to the next tab stop and desyncs all column accounting.
 fn clean_inline(text: &str) -> String {
     text.replace('\r', "").replace('\t', "    ")
+}
+
+fn syn_to_style(syn: syntect::highlighting::Style) -> Style {
+    let fg = syn.foreground;
+    let mut style = Style::default().fg(Color::Rgb { r: fg.r, g: fg.g, b: fg.b });
+    style.bold = syn.font_style.contains(FontStyle::BOLD);
+    style.italic = syn.font_style.contains(FontStyle::ITALIC);
+    style.underline = syn.font_style.contains(FontStyle::UNDERLINE);
+    style
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -541,22 +554,7 @@ impl<'a> Renderer<'a> {
         match self.prepare_kitty_image(&cap.url) {
             Some((id, cols, rows)) => {
                 self.flush_inline();
-                // Image id travels in the 24-bit foreground color.
-                let id_color = Color::Rgb {
-                    r: ((id >> 16) & 0xff) as u8,
-                    g: ((id >> 8) & 0xff) as u8,
-                    b: (id & 0xff) as u8,
-                };
-                for row in 0..rows as usize {
-                    let mut text = String::new();
-                    for col in 0..cols as usize {
-                        match crate::kitty::placeholder_cell(row, col) {
-                            Some(cell) => text.push_str(&cell),
-                            None => break,
-                        }
-                    }
-                    self.push_line(vec![Span::new(text, Style::default().fg(id_color))]);
-                }
+                self.push_placeholder_block(id, cols, rows);
                 let mut caption = Style::default().dim();
                 caption.link = Some(cap.url);
                 let alt = if cap.alt.is_empty() { "image" } else { &cap.alt };
@@ -572,12 +570,32 @@ impl<'a> Renderer<'a> {
         }
     }
 
+    /// Emits the placeholder cell grid for a queued image.
+    fn push_placeholder_block(&mut self, id: u32, cols: u16, rows: u16) {
+        // Image id travels in the 24-bit foreground color.
+        let id_color = Color::Rgb {
+            r: ((id >> 16) & 0xff) as u8,
+            g: ((id >> 8) & 0xff) as u8,
+            b: (id & 0xff) as u8,
+        };
+        for row in 0..rows as usize {
+            let mut text = String::new();
+            for col in 0..cols as usize {
+                match crate::kitty::placeholder_cell(row, col) {
+                    Some(cell) => text.push_str(&cell),
+                    None => break,
+                }
+            }
+            self.push_line(vec![Span::new(text, Style::default().fg(id_color))]);
+        }
+    }
+
     /// Loads a local image, sizes its cell grid, and queues it for protocol
     /// transmission. Returns (id, cols, rows), or None to fall back to a link.
     fn prepare_kitty_image(&mut self, url: &str) -> Option<(u32, u16, u16)> {
-        let ImageMode::Kitty { cell_w, cell_h } = self.image_mode else {
+        if !matches!(self.image_mode, ImageMode::Kitty { .. }) {
             return None;
-        };
+        }
         if url.contains("://") {
             return None; // remote images fall back to a link
         }
@@ -588,17 +606,26 @@ impl<'a> Renderer<'a> {
             self.base?.join(path)
         };
         let bytes = std::fs::read(&path).ok()?;
-        let img = image::load_from_memory(&bytes).ok()?;
-        let (px_w, px_h) = (img.width().max(1) as f64, img.height().max(1) as f64);
-
         // kitty renders PNG (f=100); re-encode other formats.
         let png = if image::guess_format(&bytes).ok() == Some(image::ImageFormat::Png) {
             bytes
         } else {
+            let img = image::load_from_memory(&bytes).ok()?;
             let mut buf = std::io::Cursor::new(Vec::new());
             img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
             buf.into_inner()
         };
+        self.queue_kitty_image(png)
+    }
+
+    /// Sizes a PNG's cell grid and queues it for transmission.
+    fn queue_kitty_image(&mut self, png: Vec<u8>) -> Option<(u32, u16, u16)> {
+        let ImageMode::Kitty { cell_w, cell_h } = self.image_mode else {
+            return None;
+        };
+        let (px_w, px_h) = image::load_from_memory(&png)
+            .ok()
+            .map(|i| (i.width().max(1) as f64, i.height().max(1) as f64))?;
 
         // Fit the cell grid to the wrap width and a height cap, never
         // upscaling beyond the image's native pixel size.
@@ -609,12 +636,48 @@ impl<'a> Renderer<'a> {
         let cols = ((px_w * scale / cell_w).ceil() as u16).max(1);
         let rows = ((px_h * scale / cell_h).ceil() as u16).max(1);
 
-        let id = self.images.len() as u32 + 1;
+        // Content-derived id (24-bit, nonzero): re-renders that renumber or
+        // add images keep ids stable per content, so the pager's
+        // already-transmitted bookkeeping never pairs an old transmit with
+        // different pixels.
+        let id = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            png.hash(&mut h);
+            ((h.finish() % 0xFF_FFFE) + 1) as u32
+        };
+        if let Some(existing) = self.images.iter().find(|i| i.id == id) {
+            // Same content appears twice; one virtual placement serves both.
+            return Some((id, existing.cols, existing.rows));
+        }
         self.images.push(KittyImage { id, png, cols, rows });
         Some((id, cols, rows))
     }
 
+    /// Renders a ```mermaid / ```latex block as an inline image. Returns
+    /// false (leaving the block untouched) when the terminal lacks graphics
+    /// support or the diagram service is unreachable.
+    fn try_emit_diagram(&mut self, code: &CodeState) -> bool {
+        if !self.diagrams || !matches!(self.image_mode, ImageMode::Kitty { .. }) {
+            return false;
+        }
+        let png = match code.lang.as_str() {
+            "mermaid" => crate::diagram::mermaid_png(&code.buf),
+            "latex" | "tex" | "math" | "katex" => crate::diagram::latex_png(&code.buf),
+            _ => None,
+        };
+        let Some(png) = png else { return false };
+        let Some((id, cols, rows)) = self.queue_kitty_image(png) else {
+            return false;
+        };
+        self.push_placeholder_block(id, cols, rows);
+        true
+    }
+
     fn emit_code(&mut self, code: CodeState) {
+        if self.try_emit_diagram(&code) {
+            return;
+        }
         let syntax = self
             .hl
             .syntaxes
@@ -632,16 +695,7 @@ impl<'a> Renderer<'a> {
                         if text.is_empty() {
                             continue;
                         }
-                        let fg = syn_style.foreground;
-                        let mut style = Style::default().fg(Color::Rgb {
-                            r: fg.r,
-                            g: fg.g,
-                            b: fg.b,
-                        });
-                        style.bold = syn_style.font_style.contains(FontStyle::BOLD);
-                        style.italic = syn_style.font_style.contains(FontStyle::ITALIC);
-                        style.underline = syn_style.font_style.contains(FontStyle::UNDERLINE);
-                        spans.push(Span::new(text, style));
+                        spans.push(Span::new(text, syn_to_style(syn_style)));
                     }
                 }
                 Err(_) => spans.push(Span::plain(line.clone())),
@@ -924,7 +978,7 @@ mod tests {
     #[test]
     fn renders_headings_into_index() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("# One\n\ntext\n\n## Two\n", 80, &hl, None, ImageMode::None);
+        let doc = render("# One\n\ntext\n\n## Two\n", 80, &hl, None, ImageMode::None, true);
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].text, "One");
         assert_eq!(doc.headings[1].level, 2);
@@ -933,7 +987,7 @@ mod tests {
     #[test]
     fn expands_tabs_in_inline_text() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("a\tb and `c\td`\n", 80, &hl, None, ImageMode::None);
+        let doc = render("a\tb and `c\td`\n", 80, &hl, None, ImageMode::None, true);
         for line in &doc.lines {
             assert!(!line.plain().contains('\t'), "raw tab in {:?}", line.plain());
         }
@@ -942,7 +996,7 @@ mod tests {
     #[test]
     fn no_double_blank_between_nested_quote_paragraphs() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("> > one\n> >\n> > two\n", 80, &hl, None, ImageMode::None);
+        let doc = render("> > one\n> >\n> > two\n", 80, &hl, None, ImageMode::None, true);
         let blanks = doc
             .lines
             .iter()
@@ -954,7 +1008,7 @@ mod tests {
     #[test]
     fn renders_admonition_title() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("> [!WARNING]\n> Careful here.\n", 80, &hl, None, ImageMode::None);
+        let doc = render("> [!WARNING]\n> Careful here.\n", 80, &hl, None, ImageMode::None, true);
         let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
         assert!(text.iter().any(|l| l.contains("Warning")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("Careful here.")), "{text:?}");
@@ -972,10 +1026,14 @@ mod tests {
 
         let hl = Highlighter::new("base16-ocean.dark");
         let kitty = ImageMode::Kitty { cell_w: 8, cell_h: 16 };
-        let doc = render("![a red square](red.png)\n", 80, &hl, Some(&dir), kitty);
+        let doc = render("![a red square](red.png)\n", 80, &hl, Some(&dir), kitty, true);
         assert_eq!(doc.images.len(), 1);
         let img = &doc.images[0];
-        assert_eq!((img.id, img.cols, img.rows), (1, 4, 4));
+        assert_eq!((img.cols, img.rows), (4, 4));
+        // Content-derived id: 24-bit, nonzero, stable across renders.
+        assert!(img.id > 0 && img.id <= 0xFF_FFFF);
+        let again = render("![a red square](red.png)\n", 80, &hl, Some(&dir), kitty, true);
+        assert_eq!(again.images[0].id, img.id);
         assert!(!img.png.is_empty());
         let placeholder_rows = doc
             .lines
@@ -987,12 +1045,27 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("a red square")), "{text:?}");
 
         // Remote URLs and ImageMode::None fall back to a link.
-        let doc = render("![remote](https://example.com/x.png)\n", 80, &hl, Some(&dir), kitty);
+        let doc = render("![remote](https://example.com/x.png)\n", 80, &hl, Some(&dir), kitty, true);
         assert!(doc.images.is_empty());
         assert!(doc.lines.iter().any(|l| l.plain().contains("🖼 remote")));
-        let doc = render("![local](red.png)\n", 80, &hl, Some(&dir), ImageMode::None);
+        let doc = render("![local](red.png)\n", 80, &hl, Some(&dir), ImageMode::None, true);
         assert!(doc.images.is_empty());
         assert!(doc.lines.iter().any(|l| l.plain().contains("🖼 local")));
+    }
+
+    #[test]
+    fn mermaid_block_stays_code_without_graphics() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        let doc = render(
+            "```mermaid\nflowchart LR\n  A --> B\n```\n",
+            80,
+            &hl,
+            None,
+            ImageMode::None,
+            true,
+        );
+        assert!(doc.images.is_empty());
+        assert!(doc.lines.iter().any(|l| l.plain().contains("A --> B")));
     }
 
     #[test]
@@ -1021,7 +1094,7 @@ mod tests {
     fn reflows_paragraph_to_width() {
         let hl = Highlighter::new("base16-ocean.dark");
         let text = "words ".repeat(40);
-        let doc = render(&text, 30, &hl, None, ImageMode::None);
+        let doc = render(&text, 30, &hl, None, ImageMode::None, true);
         for line in &doc.lines {
             assert!(line.width() <= 30, "too wide: {:?}", line.plain());
         }

@@ -78,12 +78,32 @@ GitHub-style alerts get a colored bar and title:
 
 ## Images
 
-In terminals that speak the kitty graphics protocol (kitty, Ghostty), local
-images render inline at full resolution — and because mdview uses the
+In terminals that speak the kitty graphics protocol (mdview asks the
+terminal directly at startup, so any protocol-capable terminal qualifies),
+local images render inline at full resolution — and because mdview uses the
 protocol's Unicode placeholders, they scroll just like text. Elsewhere,
 images fall back to a clickable link:
 
 ![the mdview README screenshot, rendered by mdview itself](../assets/demo.png)
+
+## Diagrams and math
+
+In graphics-capable terminals, ```` ```mermaid ```` blocks render as actual
+diagrams (via mermaid.ink) and ```` ```latex ```` blocks as typeset math (via
+codecogs), cached on disk. Without graphics or network, they stay
+syntax-highlighted code:
+
+```mermaid
+flowchart LR
+  A[markdown] --> B(mdview)
+  B --> C{kitty graphics?}
+  C -->|yes| D[inline diagrams]
+  C -->|no| E[highlighted code]
+```
+
+```latex
+\int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}
+```
 
 ## Code
 

@@ -70,6 +70,11 @@ struct Pager<'a> {
     /// Image ids already transmitted to the terminal this session.
     transmitted: std::collections::HashSet<u32>,
     doc: Document,
+    /// When false, mermaid/latex blocks show their source instead.
+    diagrams: bool,
+    /// Set when a re-render may have introduced images the terminal has not
+    /// been sent yet; main_loop syncs and clears it.
+    images_stale: bool,
     top: usize,
     w: u16,
     h: u16,
@@ -90,7 +95,8 @@ impl<'a> Pager<'a> {
     ) -> Self {
         let (w, h) = term_size();
         let image_mode = detect_image_mode();
-        let doc = render(source, wrap_width(cfg, w), hl, base, image_mode);
+        let diagrams = cfg.default_view != "text";
+        let doc = render(source, wrap_width(cfg, w), hl, base, image_mode, diagrams);
         Self {
             source,
             title: title.to_string(),
@@ -100,6 +106,8 @@ impl<'a> Pager<'a> {
             image_mode,
             transmitted: std::collections::HashSet::new(),
             doc,
+            diagrams,
+            images_stale: false,
             top: 0,
             w,
             h,
@@ -111,57 +119,121 @@ impl<'a> Pager<'a> {
         }
     }
 
-    fn content_h(&self) -> usize {
-        (self.h as usize).saturating_sub(1).max(1)
+    fn lines(&self) -> &[Line] {
+        &self.doc.lines
     }
 
-    fn max_top(&self) -> usize {
-        self.doc.lines.len().saturating_sub(self.content_h())
-    }
-
-    fn main_loop(&mut self, out: &mut io::Stdout) -> Result<()> {
-        self.sync_images(out)?;
-        loop {
-            self.draw(out)?;
-            match event::read()? {
-                Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                    self.message = None;
-                    match &self.mode {
-                        Mode::Normal => self.key_normal(key),
-                        Mode::Prompt { .. } => self.key_prompt(key),
-                        Mode::Toc { .. } => self.key_toc(key),
-                        Mode::Help => self.mode = Mode::Normal,
-                    }
-                }
-                Event::Resize(w, h) => {
-                    self.resize(w, h);
-                    self.sync_images(out)?;
-                }
-                _ => {}
-            }
-            if self.quit {
-                return Ok(());
-            }
-        }
-    }
-
-    fn resize(&mut self, w: u16, h: u16) {
-        let old_len = self.doc.lines.len().max(1);
+    /// Toggles mermaid/latex blocks between rendered diagrams and their
+    /// source, keeping the viewport position proportionally.
+    fn toggle_diagrams(&mut self) {
+        let old_len = self.lines().len().max(1);
         let frac = self.top as f64 / old_len as f64;
-        self.w = if w == 0 { 80 } else { w };
-        self.h = if h == 0 { 24 } else { h };
-        self.image_mode = detect_image_mode();
-        self.doc = render(self.source, wrap_width(self.cfg, self.w), self.hl, self.base, self.image_mode);
-        self.top = ((frac * self.doc.lines.len() as f64) as usize).min(self.max_top());
+        self.diagrams = !self.diagrams;
+        self.doc = render(
+            self.source,
+            wrap_width(self.cfg, self.w),
+            self.hl,
+            self.base,
+            self.image_mode,
+            self.diagrams,
+        );
+        self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
+        self.images_stale = true;
+        self.research();
+        self.message = Some(
+            if self.diagrams {
+                "diagrams: rendered".into()
+            } else {
+                "diagrams: source".into()
+            },
+        );
+    }
+
+    /// Re-runs the current search against the active view's lines.
+    fn research(&mut self) {
         if let Some(s) = &self.search {
             let query = s.query.clone();
-            let matches = find_matches(&self.doc.lines, &query);
+            let matches = find_matches(self.lines(), &query);
             self.search = if matches.is_empty() {
                 None
             } else {
                 Some(Search { query, cur: nearest_match(&matches, self.top), matches })
             };
         }
+    }
+
+    fn content_h(&self) -> usize {
+        (self.h as usize).saturating_sub(1).max(1)
+    }
+
+    fn max_top(&self) -> usize {
+        self.lines().len().saturating_sub(self.content_h())
+    }
+
+    fn main_loop(&mut self, out: &mut io::Stdout) -> Result<()> {
+        self.sync_images(out)?;
+        self.draw(out)?;
+        loop {
+            let mut changed = false;
+            // Wake periodically so finished background diagram fetches can be
+            // swapped in without waiting for the next keypress.
+            if event::poll(std::time::Duration::from_millis(250))? {
+                match event::read()? {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        self.message = None;
+                        match &self.mode {
+                            Mode::Normal => self.key_normal(key),
+                            Mode::Prompt { .. } => self.key_prompt(key),
+                            Mode::Toc { .. } => self.key_toc(key),
+                            Mode::Help => self.mode = Mode::Normal,
+                        }
+                        changed = true;
+                    }
+                    Event::Resize(w, h) => {
+                        self.resize(w, h);
+                        self.sync_images(out)?;
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if crate::diagram::take_dirty() {
+                // A diagram finished rendering: re-render at current size.
+                self.resize(self.w, self.h);
+                self.images_stale = true;
+                changed = true;
+            }
+            if self.images_stale {
+                self.sync_images(out)?;
+                self.images_stale = false;
+            }
+            if self.quit {
+                return Ok(());
+            }
+            if changed {
+                self.draw(out)?;
+            }
+        }
+    }
+
+    fn resize(&mut self, w: u16, h: u16) {
+        let old_len = self.lines().len().max(1);
+        let frac = self.top as f64 / old_len as f64;
+        self.w = if w == 0 { 80 } else { w };
+        self.h = if h == 0 { 24 } else { h };
+        self.image_mode = detect_image_mode();
+        self.doc = render(
+            self.source,
+            wrap_width(self.cfg, self.w),
+            self.hl,
+            self.base,
+            self.image_mode,
+            self.diagrams,
+        );
+        self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
+        self.research();
     }
 
     /// Transmits any images the terminal hasn't seen and (re)creates their
@@ -226,9 +298,10 @@ impl<'a> Pager<'a> {
             KeyCode::Char('p') | KeyCode::Char('%') => {
                 if let Some(n) = self.take_count() {
                     let n = n.min(100);
-                    self.top = (self.doc.lines.len() * n / 100).min(self.max_top());
+                    self.top = (self.lines().len() * n / 100).min(self.max_top());
                 }
             }
+            KeyCode::Char('v') => self.toggle_diagrams(),
             KeyCode::Char('/') => self.mode = Mode::Prompt { backward: false, buf: String::new() },
             KeyCode::Char('?') => self.mode = Mode::Prompt { backward: true, buf: String::new() },
             KeyCode::Char('n') => self.next_match(1),
@@ -310,7 +383,7 @@ impl<'a> Pager<'a> {
     }
 
     fn do_search(&mut self, query: String, backward: bool) {
-        let matches = find_matches(&self.doc.lines, &query);
+        let matches = find_matches(self.lines(), &query);
         if matches.is_empty() {
             self.message = Some(format!("Pattern not found: {query}"));
             self.search = None;
@@ -361,7 +434,7 @@ impl<'a> Pager<'a> {
         for row in 0..rows {
             queue!(out, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
             let idx = self.top + row;
-            if idx < self.doc.lines.len() {
+            if idx < self.lines().len() {
                 self.draw_line(out, idx)?;
             } else {
                 queue!(
@@ -384,7 +457,7 @@ impl<'a> Pager<'a> {
     }
 
     fn draw_line(&self, out: &mut io::Stdout, idx: usize) -> Result<()> {
-        let line = &self.doc.lines[idx];
+        let line = &self.lines()[idx];
         // Matches are sorted by line, so binary-search the slice for this row
         // instead of scanning every match per visible line per frame.
         let ranges: Vec<(usize, usize)> = match &self.search {
@@ -430,7 +503,7 @@ impl<'a> Pager<'a> {
             return Ok(());
         }
 
-        let total = self.doc.lines.len();
+        let total = self.lines().len();
         let bottom = (self.top + self.content_h()).min(total);
         let right = if total == 0 || bottom >= total {
             format!(" {}-{}/{} END ", self.top.min(total) + 1, bottom, total)
@@ -507,10 +580,12 @@ impl<'a> Pager<'a> {
             ("n / N", "next / previous match"),
             ("] / [", "next / previous heading"),
             ("t", "table of contents"),
+            ("v", "show diagrams rendered / as source"),
             ("h", "this help"),
         ];
         let key_w = 14;
-        let inner_w = 40.min((self.w as usize).saturating_sub(6)).max(20);
+        let desc_w = entries.iter().map(|(_, d)| d.width()).max().unwrap_or(20);
+        let inner_w = (key_w + desc_w).min((self.w as usize).saturating_sub(6)).max(20);
         let inner_h = entries.len().min(self.content_h().saturating_sub(2));
         let x0 = (self.w as usize).saturating_sub(inner_w + 4) / 2;
         let y0 = self.content_h().saturating_sub(inner_h + 2) / 2;
@@ -564,20 +639,37 @@ fn term_size() -> (u16, u16) {
     (if w == 0 { 80 } else { w }, if h == 0 { 24 } else { h })
 }
 
+/// Answers "does this terminal do kitty graphics with Unicode placeholders",
+/// probing the terminal once per session (any protocol-capable terminal —
+/// kitty, Ghostty, Konsole, … — answers the query; env vars are only the
+/// fallback when the probe times out). WezTerm answers the query but does not
+/// implement Unicode placeholders, so it is explicitly excluded.
+fn graphics_probe() -> &'static crate::kitty::Probe {
+    static PROBE: std::sync::OnceLock<crate::kitty::Probe> = std::sync::OnceLock::new();
+    PROBE.get_or_init(|| crate::kitty::probe_terminal(std::time::Duration::from_millis(500)))
+}
+
 /// Kitty graphics need protocol support plus the terminal's cell pixel size
-/// (from the window-size ioctl) to scale image grids.
+/// (window-size ioctl, or the probe's CSI 16t reply) to scale image grids.
 fn detect_image_mode() -> ImageMode {
-    if !crate::kitty::supported() {
+    let term = std::env::var("TERM").unwrap_or_default();
+    let prog = std::env::var("TERM_PROGRAM").unwrap_or_default();
+    if prog.eq_ignore_ascii_case("wezterm") || term.contains("wezterm") {
         return ImageMode::None;
     }
-    match terminal::window_size() {
+    let probe = graphics_probe();
+    if !probe.graphics && !crate::kitty::env_hint() {
+        return ImageMode::None;
+    }
+    let ioctl_cell = match terminal::window_size() {
         Ok(ws) if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 => {
-            ImageMode::Kitty {
-                cell_w: (ws.width / ws.columns).max(1),
-                cell_h: (ws.height / ws.rows).max(1),
-            }
+            Some(((ws.width / ws.columns).max(1), (ws.height / ws.rows).max(1)))
         }
-        _ => ImageMode::None,
+        _ => None,
+    };
+    match ioctl_cell.or(probe.cell) {
+        Some((cell_w, cell_h)) => ImageMode::Kitty { cell_w, cell_h },
+        None => ImageMode::None,
     }
 }
 

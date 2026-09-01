@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+libc = "0.2"
 # use-dev-tty: kqueue cannot poll /dev/tty on macOS, which breaks reading
 # keys while stdin is a pipe (`cat foo.md | mdview`); the select()-based
 # event source handles it.
@@ -16,9 +17,11 @@ dirs = "6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 syntect = "5"
 toml = "0.8"
 unicode-width = "0.2"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
 
 [profile.release]
 lto = true

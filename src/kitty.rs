@@ -5,8 +5,9 @@
 //! ordinary text cells: U+10EEEE with a row and a column diacritic, with the
 //! image id encoded in the 24-bit foreground color. Because those are plain
 //! cells, scrolling, clearing, and overwriting need no special handling.
-//! Supported by kitty and Ghostty; other terminals get the half-block
-//! fallback renderer.
+//! Support is detected by probing the terminal (see `probe_terminal`), so any
+//! terminal implementing the protocol qualifies; unsupported terminals render
+//! images as plain hyperlinks instead.
 
 use base64::Engine;
 use std::io::{self, Write};
@@ -61,16 +62,163 @@ pub const ROW_COLUMN_DIACRITICS: [char; 297] = [
     '\u{1D242}', '\u{1D243}', '\u{1D244}'
 ];
 
-/// True when the terminal implements the kitty graphics protocol with
-/// Unicode placeholders (kitty and Ghostty; WezTerm's kitty support lacks
-/// placeholders, so it is excluded).
-pub fn supported() -> bool {
+/// Environment hint that the terminal speaks the protocol; used when the
+/// runtime probe gets no answer (e.g. very slow links).
+pub fn env_hint() -> bool {
     if std::env::var_os("KITTY_WINDOW_ID").is_some() {
         return true;
     }
     let term = std::env::var("TERM").unwrap_or_default();
     let prog = std::env::var("TERM_PROGRAM").unwrap_or_default();
     term.contains("kitty") || term.contains("ghostty") || prog.eq_ignore_ascii_case("ghostty")
+}
+
+/// What the terminal told us when probed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Probe {
+    /// It answered the graphics query, so it implements the protocol.
+    pub graphics: bool,
+    /// Cell pixel size from a CSI 16t reply, if given.
+    pub cell: Option<(u16, u16)>,
+}
+
+/// Probes the terminal directly (requires raw mode): a graphics query and a
+/// cell-size query, terminated by DA1 — every terminal answers DA1, so its
+/// reply tells us the others aren't coming. This detects any terminal that
+/// implements the protocol, not just ones we know by name.
+pub fn probe_terminal(timeout: std::time::Duration) -> Probe {
+    let mut probe = Probe::default();
+    unsafe {
+        let fd = libc::open(
+            c"/dev/tty".as_ptr(),
+            libc::O_RDWR | libc::O_NOCTTY | libc::O_NONBLOCK,
+        );
+        if fd < 0 {
+            return probe;
+        }
+        // 1x1 RGB query image (id 31), then CSI 16t, then DA1.
+        let query = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
+        if libc::write(fd, query.as_ptr().cast(), query.len()) < 0 {
+            libc::close(fd);
+            return probe;
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            if remain.is_zero() {
+                break;
+            }
+            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+            let ready = libc::poll(&mut pfd, 1, remain.as_millis() as libc::c_int);
+            if ready <= 0 {
+                break;
+            }
+            // poll also wakes on POLLHUP/POLLERR with no data; reading then
+            // would block (or spin). Only read when input is actually there.
+            if pfd.revents & libc::POLLIN == 0 {
+                break;
+            }
+            let mut chunk = [0u8; 256];
+            let n = libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len());
+            if n <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n as usize]);
+            if da1_answered(&buf) {
+                break;
+            }
+        }
+        // Keystrokes typed during the probe window land in `buf` alongside
+        // the responses; push them back into the tty input queue so the
+        // pager's event loop still sees them (best effort — TIOCSTI may be
+        // disabled on hardened Linux, in which case they are dropped).
+        for b in non_response_bytes(&buf) {
+            let _ = libc::ioctl(fd, libc::TIOCSTI, &b as *const u8);
+        }
+        libc::close(fd);
+        parse_probe(&buf, &mut probe);
+    }
+    probe
+}
+
+/// Everything in the probe buffer that is not part of an escape-sequence
+/// response: APC (`ESC _ ... ESC \`) and CSI (`ESC [ ... final`) are skipped.
+fn non_response_bytes(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() {
+            match buf[i + 1] {
+                b'_' => {
+                    // APC: runs until ESC \
+                    let end = find(&buf[i + 2..], b"\x1b\\").map(|e| i + 2 + e + 2);
+                    i = end.unwrap_or(buf.len());
+                    continue;
+                }
+                b'[' => {
+                    // CSI: parameter/intermediate bytes, then a final 0x40-0x7e.
+                    // Only OUR responses are dropped (DA1 `ESC[?..c`, cell size
+                    // `ESC[6;..t`); anything else — arrow keys, PgUp/PgDn —
+                    // is a keystroke and must be re-injected intact.
+                    let mut j = i + 2;
+                    while j < buf.len() && !(0x40..=0x7e).contains(&buf[j]) {
+                        j += 1;
+                    }
+                    let end = (j + 1).min(buf.len());
+                    let seq = &buf[i..end];
+                    let is_da1 = seq.get(2) == Some(&b'?') && seq.last() == Some(&b'c');
+                    let is_cell = seq.starts_with(b"\x1b[6;") && seq.last() == Some(&b't');
+                    if !is_da1 && !is_cell {
+                        out.extend_from_slice(seq);
+                    }
+                    i = end;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    out
+}
+
+/// The DA1 reply (`ESC [ ? ... c`) marks the end of the probe conversation.
+fn da1_answered(buf: &[u8]) -> bool {
+    if let Some(i) = find(buf, b"\x1b[?") {
+        return buf[i + 3..].contains(&b'c');
+    }
+    false
+}
+
+fn parse_probe(buf: &[u8], probe: &mut Probe) {
+    // Graphics reply: ESC _ G i=31 ... ; OK ESC \
+    if let Some(i) = find(buf, b"\x1b_G") {
+        let tail = &buf[i..];
+        let end = find(tail, b"\x1b\\").unwrap_or(tail.len());
+        probe.graphics = find(&tail[..end], b"OK").is_some();
+    }
+    // Cell size reply: ESC [ 6 ; <height> ; <width> t
+    if let Some(i) = find(buf, b"\x1b[6;") {
+        let tail = &buf[i + 4..];
+        if let Some(t) = tail.iter().position(|&b| b == b't') {
+            let body = String::from_utf8_lossy(&tail[..t]);
+            let mut parts = body.split(';');
+            if let (Some(h), Some(w)) = (
+                parts.next().and_then(|v| v.parse::<u16>().ok()),
+                parts.next().and_then(|v| v.parse::<u16>().ok()),
+            ) {
+                if h > 0 && w > 0 {
+                    probe.cell = Some((w, h));
+                }
+            }
+        }
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Transmits PNG data for `id` (chunked; q=2 suppresses responses).

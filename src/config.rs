@@ -12,6 +12,9 @@ pub struct Config {
     pub wrap_width: usize,
     /// Syntect theme used for fenced code blocks.
     pub code_theme: String,
+    /// How mermaid/latex blocks start out: "rendered" as diagrams, or as
+    /// their "text" source (toggled in the pager with v).
+    pub default_view: String,
 }
 
 impl Default for Config {
@@ -19,6 +22,7 @@ impl Default for Config {
         Self {
             wrap_width: 80,
             code_theme: "base16-ocean.dark".to_string(),
+            default_view: "rendered".to_string(),
         }
     }
 }
@@ -60,6 +64,10 @@ wrap_width = 80
 #   base16-ocean.dark, base16-eighties.dark, base16-mocha.dark,
 #   base16-ocean.light, InspiredGitHub, Solarized (dark), Solarized (light)
 code_theme = "base16-ocean.dark"
+
+# How mermaid/latex blocks start out: "rendered" diagrams, or their "text"
+# source (toggle with v).
+default_view = "rendered"
 "#;
 
 /// Validates the config file, returning an error message if it won't load
@@ -70,6 +78,9 @@ pub fn check(path: &std::path::Path) -> Result<Config> {
     let cfg: Config = toml::from_str(&contents)?;
     if cfg.wrap_width < 20 {
         bail!("wrap_width must be at least 20");
+    }
+    if !["rendered", "text"].contains(&cfg.default_view.as_str()) {
+        bail!("default_view must be \"rendered\" or \"text\"");
     }
     let themes = syntect::highlighting::ThemeSet::load_defaults().themes;
     if !themes.contains_key(&cfg.code_theme) {
