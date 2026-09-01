@@ -1,7 +1,7 @@
 use crate::text::{Line, Span, Style};
 use crossterm::style::Color;
 use pulldown_cmark::{
-    Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
@@ -50,6 +50,7 @@ pub fn render(source: &str, width: usize, hl: &Highlighter) -> Document {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_GFM); // admonitions: > [!NOTE] etc.
 
     let mut r = Renderer {
         width: width.max(20),
@@ -268,14 +269,27 @@ impl<'a> Renderer<'a> {
                 self.block_start();
                 self.styles.push(heading_style(heading_level(level)));
             }
-            Tag::BlockQuote(_) => {
+            Tag::BlockQuote(kind) => {
                 self.block_start();
+                let (color, title) = match kind {
+                    Some(BlockQuoteKind::Note) => (Color::Blue, Some("Note")),
+                    Some(BlockQuoteKind::Tip) => (Color::Green, Some("Tip")),
+                    Some(BlockQuoteKind::Important) => (Color::Magenta, Some("Important")),
+                    Some(BlockQuoteKind::Warning) => (Color::Yellow, Some("Warning")),
+                    Some(BlockQuoteKind::Caution) => (Color::Red, Some("Caution")),
+                    None => (Color::DarkGreen, None),
+                };
                 self.prefixes.push(Prefix {
                     first: format!("{QUOTE_BAR} "),
                     rest: format!("{QUOTE_BAR} "),
-                    style: Style::default().fg(Color::DarkGreen),
+                    style: Style::default().fg(color),
                     first_done: true,
                 });
+                if let Some(title) = title {
+                    self.push_line(vec![Span::new(title, Style::default().fg(color).bold())]);
+                    // Content follows directly under the title, no blank line.
+                    self.at_item_start = true;
+                }
             }
             Tag::CodeBlock(kind) => {
                 self.block_start();
@@ -799,6 +813,17 @@ mod tests {
             .filter(|l| l.plain().chars().all(|c| c.is_whitespace() || c == QUOTE_BAR))
             .count();
         assert_eq!(blanks, 1, "{:?}", doc.lines.iter().map(|l| l.plain()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn renders_admonition_title() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        let doc = render("> [!WARNING]\n> Careful here.\n", 80, &hl);
+        let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
+        assert!(text.iter().any(|l| l.contains("Warning")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("Careful here.")), "{text:?}");
+        // Title line and body both carry the quote bar.
+        assert!(text.iter().filter(|l| l.contains(QUOTE_BAR)).count() >= 2);
     }
 
     #[test]

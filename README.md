@@ -9,8 +9,9 @@ curl -s https://example.com/notes.md | mdview
 
 Headings are colored and indexed, paragraphs are reflowed to a configurable
 width, fenced code blocks are syntax-highlighted, tables get box-drawing
-borders, and links are emitted as OSC 8 hyperlinks (clickable in iTerm2,
-Ghostty, WezTerm, kitty, and friends).
+borders, GitHub-style admonitions (`> [!NOTE]`, `> [!WARNING]`, …) get colored
+bars and titles, and links are emitted as OSC 8 hyperlinks (clickable in
+iTerm2, Ghostty, WezTerm, kitty, and friends).
 
 ![mdview rendering examples/demo.md](assets/demo.png)
 

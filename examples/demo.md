@@ -57,6 +57,25 @@ keeps its continuation lines aligned under the text, not under the bullet.
 >
 > > Quotes nest — each level adds another bar.
 
+## Admonitions
+
+GitHub-style alerts get a colored bar and title:
+
+> [!NOTE]
+> Useful information that users should know, even when skimming.
+
+> [!TIP]
+> Helpful advice for doing things better.
+
+> [!IMPORTANT]
+> Key information users need to know to achieve their goal.
+
+> [!WARNING]
+> Urgent info that needs immediate user attention.
+
+> [!CAUTION]
+> Advises about risks or negative outcomes.
+
 ## Code
 
 Fenced code blocks are syntax-highlighted with syntect (theme configurable
