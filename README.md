@@ -36,16 +36,16 @@ work automatically); other terminals see a clickable link instead.
 Shell installer (macOS or Linux, no toolchain needed):
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/landonturner/markdown/releases/latest/download/mdview-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/landonturner/mdview/releases/latest/download/mdview-installer.sh | sh
 ```
 
 With [mise](https://mise.jdx.dev) (verifies SLSA build provenance):
 
 ```sh
-mise use -g "github:landonturner/markdown[exe=mdview]@latest"
+mise use -g github:landonturner/mdview@latest
 ```
 
-Or from source: `cargo install --git https://github.com/landonturner/markdown`
+Or from source: `cargo install --git https://github.com/landonturner/mdview`
 
 ## Building
 
