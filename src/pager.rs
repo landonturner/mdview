@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::render::{render, Document, Highlighter};
+use crate::render::{render, Document, Highlighter, ImageMode};
 use crate::text::{Line, Style};
 use anyhow::Result;
 use crossterm::{
@@ -15,14 +15,21 @@ use crossterm::{
 use std::io::{self, Write};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub fn run(source: &str, title: &str, cfg: &Config, hl: &Highlighter) -> Result<()> {
+pub fn run(
+    source: &str,
+    title: &str,
+    cfg: &Config,
+    hl: &Highlighter,
+    base: Option<&std::path::Path>,
+) -> Result<()> {
     let mut out = io::stdout();
     enable_raw_mode()?;
     // From here on, always restore the terminal — even if entering the
     // alternate screen fails, raw mode must not leak to the shell.
     let result = execute!(out, EnterAlternateScreen, cursor::Hide)
         .map_err(Into::into)
-        .and_then(|_| Pager::new(source, title, cfg, hl).main_loop(&mut out));
+        .and_then(|_| Pager::new(source, title, cfg, hl, base).main_loop(&mut out));
+    let _ = crate::kitty::delete_all(&mut out);
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     result
@@ -58,6 +65,10 @@ struct Pager<'a> {
     title: String,
     cfg: &'a Config,
     hl: &'a Highlighter,
+    base: Option<&'a std::path::Path>,
+    image_mode: ImageMode,
+    /// Image ids already transmitted to the terminal this session.
+    transmitted: std::collections::HashSet<u32>,
     doc: Document,
     top: usize,
     w: u16,
@@ -70,14 +81,24 @@ struct Pager<'a> {
 }
 
 impl<'a> Pager<'a> {
-    fn new(source: &'a str, title: &str, cfg: &'a Config, hl: &'a Highlighter) -> Self {
+    fn new(
+        source: &'a str,
+        title: &str,
+        cfg: &'a Config,
+        hl: &'a Highlighter,
+        base: Option<&'a std::path::Path>,
+    ) -> Self {
         let (w, h) = term_size();
-        let doc = render(source, wrap_width(cfg, w), hl);
+        let image_mode = detect_image_mode();
+        let doc = render(source, wrap_width(cfg, w), hl, base, image_mode);
         Self {
             source,
             title: title.to_string(),
             cfg,
             hl,
+            base,
+            image_mode,
+            transmitted: std::collections::HashSet::new(),
             doc,
             top: 0,
             w,
@@ -99,6 +120,7 @@ impl<'a> Pager<'a> {
     }
 
     fn main_loop(&mut self, out: &mut io::Stdout) -> Result<()> {
+        self.sync_images(out)?;
         loop {
             self.draw(out)?;
             match event::read()? {
@@ -111,7 +133,10 @@ impl<'a> Pager<'a> {
                         Mode::Help => self.mode = Mode::Normal,
                     }
                 }
-                Event::Resize(w, h) => self.resize(w, h),
+                Event::Resize(w, h) => {
+                    self.resize(w, h);
+                    self.sync_images(out)?;
+                }
                 _ => {}
             }
             if self.quit {
@@ -125,7 +150,8 @@ impl<'a> Pager<'a> {
         let frac = self.top as f64 / old_len as f64;
         self.w = if w == 0 { 80 } else { w };
         self.h = if h == 0 { 24 } else { h };
-        self.doc = render(self.source, wrap_width(self.cfg, self.w), self.hl);
+        self.image_mode = detect_image_mode();
+        self.doc = render(self.source, wrap_width(self.cfg, self.w), self.hl, self.base, self.image_mode);
         self.top = ((frac * self.doc.lines.len() as f64) as usize).min(self.max_top());
         if let Some(s) = &self.search {
             let query = s.query.clone();
@@ -136,6 +162,19 @@ impl<'a> Pager<'a> {
                 Some(Search { query, cur: nearest_match(&matches, self.top), matches })
             };
         }
+    }
+
+    /// Transmits any images the terminal hasn't seen and (re)creates their
+    /// virtual placements. Placeholder cells in the document do the rest.
+    fn sync_images(&mut self, out: &mut io::Stdout) -> Result<()> {
+        for img in &self.doc.images {
+            if self.transmitted.insert(img.id) {
+                crate::kitty::transmit(out, img.id, &img.png)?;
+            }
+            crate::kitty::place(out, img.id, img.cols, img.rows)?;
+        }
+        out.flush()?;
+        Ok(())
     }
 
     fn take_count(&mut self) -> Option<usize> {
@@ -523,6 +562,23 @@ impl<'a> Pager<'a> {
 fn term_size() -> (u16, u16) {
     let (w, h) = terminal::size().unwrap_or((80, 24));
     (if w == 0 { 80 } else { w }, if h == 0 { 24 } else { h })
+}
+
+/// Kitty graphics need protocol support plus the terminal's cell pixel size
+/// (from the window-size ioctl) to scale image grids.
+fn detect_image_mode() -> ImageMode {
+    if !crate::kitty::supported() {
+        return ImageMode::None;
+    }
+    match terminal::window_size() {
+        Ok(ws) if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 => {
+            ImageMode::Kitty {
+                cell_w: (ws.width / ws.columns).max(1),
+                cell_h: (ws.height / ws.rows).max(1),
+            }
+        }
+        _ => ImageMode::None,
+    }
 }
 
 fn wrap_width(cfg: &Config, term_w: u16) -> usize {

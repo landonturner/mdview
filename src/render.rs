@@ -3,6 +3,7 @@ use crossterm::style::Color;
 use pulldown_cmark::{
     Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
 };
+use std::path::Path;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -10,6 +11,26 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const QUOTE_BAR: char = '▎';
 const MAX_TABLE_CELL: usize = 40;
+/// Tallest an inline image renders, in terminal rows.
+const MAX_IMAGE_ROWS: u16 = 24;
+
+/// How images are drawn.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ImageMode {
+    /// No graphics: images render as "🖼 alt" hyperlinks.
+    None,
+    /// Kitty graphics protocol (Unicode placeholders), with the terminal's
+    /// cell size in pixels for scaling.
+    Kitty { cell_w: u16, cell_h: u16 },
+}
+
+/// An image queued for kitty-protocol transmission by the pager.
+pub struct KittyImage {
+    pub id: u32,
+    pub png: Vec<u8>,
+    pub cols: u16,
+    pub rows: u16,
+}
 /// Soft blue for links; explicit RGB so it reads as blue regardless of how
 /// the terminal theme tints ANSI bright-blue.
 const LINK_COLOR: Color = Color::Rgb { r: 0x5f, g: 0xaf, b: 0xff };
@@ -23,6 +44,7 @@ pub struct Heading {
 pub struct Document {
     pub lines: Vec<Line>,
     pub headings: Vec<Heading>,
+    pub images: Vec<KittyImage>,
 }
 
 /// Owns the (expensive to load) syntect data so it survives re-renders.
@@ -44,7 +66,13 @@ impl Highlighter {
     }
 }
 
-pub fn render(source: &str, width: usize, hl: &Highlighter) -> Document {
+pub fn render(
+    source: &str,
+    width: usize,
+    hl: &Highlighter,
+    base: Option<&Path>,
+    image_mode: ImageMode,
+) -> Document {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -55,6 +83,9 @@ pub fn render(source: &str, width: usize, hl: &Highlighter) -> Document {
     let mut r = Renderer {
         width: width.max(20),
         hl,
+        base,
+        image_mode,
+        images: Vec::new(),
         lines: Vec::new(),
         headings: Vec::new(),
         inline: Vec::new(),
@@ -63,6 +94,7 @@ pub fn render(source: &str, width: usize, hl: &Highlighter) -> Document {
         list_stack: Vec::new(),
         table: None,
         code: None,
+        image: None,
         at_item_start: false,
     };
     for event in Parser::new_ext(source, opts) {
@@ -72,7 +104,7 @@ pub fn render(source: &str, width: usize, hl: &Highlighter) -> Document {
     while r.lines.last().is_some_and(|l| l.plain().trim().is_empty()) {
         r.lines.pop();
     }
-    Document { lines: r.lines, headings: r.headings }
+    Document { lines: r.lines, headings: r.headings, images: r.images }
 }
 
 struct Prefix {
@@ -95,9 +127,19 @@ struct CodeState {
     buf: String,
 }
 
+/// Alt text and target collected between Start(Image) and End(Image).
+struct ImageCapture {
+    url: String,
+    alt: String,
+}
+
 struct Renderer<'a> {
     width: usize,
     hl: &'a Highlighter,
+    /// Directory the markdown file lives in; resolves relative image paths.
+    base: Option<&'a Path>,
+    image_mode: ImageMode,
+    images: Vec<KittyImage>,
     lines: Vec<Line>,
     headings: Vec<Heading>,
     inline: Vec<Span>,
@@ -106,6 +148,7 @@ struct Renderer<'a> {
     list_stack: Vec<Option<u64>>,
     table: Option<TableState>,
     code: Option<CodeState>,
+    image: Option<ImageCapture>,
     at_item_start: bool,
 }
 
@@ -216,6 +259,28 @@ impl<'a> Renderer<'a> {
                     self.emit_code(code);
                     return;
                 }
+                _ => return,
+            }
+        }
+
+        // Between Start(Image) and End(Image), inline events feed the alt text.
+        if self.image.is_some() {
+            match event {
+                Event::Text(t) | Event::Code(t) | Event::InlineHtml(t) => {
+                    self.image.as_mut().unwrap().alt.push_str(&t);
+                    return;
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    self.image.as_mut().unwrap().alt.push(' ');
+                    return;
+                }
+                Event::End(TagEnd::Image) => {
+                    let cap = self.image.take().unwrap();
+                    self.emit_image(cap);
+                    return;
+                }
+                // Nested emphasis/links inside alt text: keep only the text.
+                Event::Start(_) | Event::End(_) => return,
                 _ => return,
             }
         }
@@ -382,12 +447,7 @@ impl<'a> Renderer<'a> {
                 self.styles.push(s);
             }
             Tag::Image { dest_url, .. } => {
-                let mut s = self.cur_style();
-                s.fg = Some(LINK_COLOR);
-                s.underline = true;
-                s.link = Some(dest_url.to_string());
-                self.styles.push(s.clone());
-                self.inline.push(Span::new("🖼 ", s));
+                self.image = Some(ImageCapture { url: dest_url.to_string(), alt: String::new() });
             }
             Tag::FootnoteDefinition(name) => {
                 self.block_start();
@@ -461,13 +521,10 @@ impl<'a> Renderer<'a> {
                     t.cur_row.push(spans);
                 }
             }
-            TagEnd::Emphasis
-            | TagEnd::Strong
-            | TagEnd::Strikethrough
-            | TagEnd::Link
-            | TagEnd::Image => {
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                 self.styles.pop();
             }
+            TagEnd::Image => {} // handled by the image intercept in event()
             TagEnd::FootnoteDefinition => {
                 self.flush_inline();
                 self.prefixes.pop();
@@ -476,6 +533,85 @@ impl<'a> Renderer<'a> {
             TagEnd::HtmlBlock => self.flush_inline(),
             _ => {}
         }
+    }
+
+    /// Emits an image as kitty Unicode-placeholder cells when the terminal
+    /// supports the graphics protocol; otherwise as a "🖼 alt" hyperlink.
+    fn emit_image(&mut self, cap: ImageCapture) {
+        match self.prepare_kitty_image(&cap.url) {
+            Some((id, cols, rows)) => {
+                self.flush_inline();
+                // Image id travels in the 24-bit foreground color.
+                let id_color = Color::Rgb {
+                    r: ((id >> 16) & 0xff) as u8,
+                    g: ((id >> 8) & 0xff) as u8,
+                    b: (id & 0xff) as u8,
+                };
+                for row in 0..rows as usize {
+                    let mut text = String::new();
+                    for col in 0..cols as usize {
+                        match crate::kitty::placeholder_cell(row, col) {
+                            Some(cell) => text.push_str(&cell),
+                            None => break,
+                        }
+                    }
+                    self.push_line(vec![Span::new(text, Style::default().fg(id_color))]);
+                }
+                let mut caption = Style::default().dim();
+                caption.link = Some(cap.url);
+                let alt = if cap.alt.is_empty() { "image" } else { &cap.alt };
+                self.push_line(vec![Span::new(format!("🖼 {alt}"), caption)]);
+            }
+            None => {
+                let mut s = self.cur_style();
+                s.fg = Some(LINK_COLOR);
+                s.underline = true;
+                s.link = Some(cap.url);
+                self.inline.push(Span::new(format!("🖼 {}", cap.alt), s));
+            }
+        }
+    }
+
+    /// Loads a local image, sizes its cell grid, and queues it for protocol
+    /// transmission. Returns (id, cols, rows), or None to fall back to a link.
+    fn prepare_kitty_image(&mut self, url: &str) -> Option<(u32, u16, u16)> {
+        let ImageMode::Kitty { cell_w, cell_h } = self.image_mode else {
+            return None;
+        };
+        if url.contains("://") {
+            return None; // remote images fall back to a link
+        }
+        let path = Path::new(url);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.base?.join(path)
+        };
+        let bytes = std::fs::read(&path).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?;
+        let (px_w, px_h) = (img.width().max(1) as f64, img.height().max(1) as f64);
+
+        // kitty renders PNG (f=100); re-encode other formats.
+        let png = if image::guess_format(&bytes).ok() == Some(image::ImageFormat::Png) {
+            bytes
+        } else {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+            buf.into_inner()
+        };
+
+        // Fit the cell grid to the wrap width and a height cap, never
+        // upscaling beyond the image's native pixel size.
+        let (cell_w, cell_h) = (cell_w.max(1) as f64, cell_h.max(1) as f64);
+        let scale = (self.avail() as f64 * cell_w / px_w)
+            .min(MAX_IMAGE_ROWS as f64 * cell_h / px_h)
+            .min(1.0);
+        let cols = ((px_w * scale / cell_w).ceil() as u16).max(1);
+        let rows = ((px_h * scale / cell_h).ceil() as u16).max(1);
+
+        let id = self.images.len() as u32 + 1;
+        self.images.push(KittyImage { id, png, cols, rows });
+        Some((id, cols, rows))
     }
 
     fn emit_code(&mut self, code: CodeState) {
@@ -788,7 +924,7 @@ mod tests {
     #[test]
     fn renders_headings_into_index() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("# One\n\ntext\n\n## Two\n", 80, &hl);
+        let doc = render("# One\n\ntext\n\n## Two\n", 80, &hl, None, ImageMode::None);
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].text, "One");
         assert_eq!(doc.headings[1].level, 2);
@@ -797,7 +933,7 @@ mod tests {
     #[test]
     fn expands_tabs_in_inline_text() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("a\tb and `c\td`\n", 80, &hl);
+        let doc = render("a\tb and `c\td`\n", 80, &hl, None, ImageMode::None);
         for line in &doc.lines {
             assert!(!line.plain().contains('\t'), "raw tab in {:?}", line.plain());
         }
@@ -806,7 +942,7 @@ mod tests {
     #[test]
     fn no_double_blank_between_nested_quote_paragraphs() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("> > one\n> >\n> > two\n", 80, &hl);
+        let doc = render("> > one\n> >\n> > two\n", 80, &hl, None, ImageMode::None);
         let blanks = doc
             .lines
             .iter()
@@ -818,7 +954,7 @@ mod tests {
     #[test]
     fn renders_admonition_title() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("> [!WARNING]\n> Careful here.\n", 80, &hl);
+        let doc = render("> [!WARNING]\n> Careful here.\n", 80, &hl, None, ImageMode::None);
         let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
         assert!(text.iter().any(|l| l.contains("Warning")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("Careful here.")), "{text:?}");
@@ -827,10 +963,65 @@ mod tests {
     }
 
     #[test]
+    fn kitty_mode_emits_placeholders_and_queues_image() {
+        let dir = std::env::temp_dir().join("mdview-test-img");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 32x64 px at 8x16 cells -> a 4x4 placeholder grid.
+        let img = image::RgbaImage::from_pixel(32, 64, image::Rgba([255, 0, 0, 255]));
+        img.save(dir.join("red.png")).unwrap();
+
+        let hl = Highlighter::new("base16-ocean.dark");
+        let kitty = ImageMode::Kitty { cell_w: 8, cell_h: 16 };
+        let doc = render("![a red square](red.png)\n", 80, &hl, Some(&dir), kitty);
+        assert_eq!(doc.images.len(), 1);
+        let img = &doc.images[0];
+        assert_eq!((img.id, img.cols, img.rows), (1, 4, 4));
+        assert!(!img.png.is_empty());
+        let placeholder_rows = doc
+            .lines
+            .iter()
+            .filter(|l| l.plain().contains(crate::kitty::PLACEHOLDER))
+            .count();
+        assert_eq!(placeholder_rows, 4);
+        let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
+        assert!(text.iter().any(|l| l.contains("a red square")), "{text:?}");
+
+        // Remote URLs and ImageMode::None fall back to a link.
+        let doc = render("![remote](https://example.com/x.png)\n", 80, &hl, Some(&dir), kitty);
+        assert!(doc.images.is_empty());
+        assert!(doc.lines.iter().any(|l| l.plain().contains("🖼 remote")));
+        let doc = render("![local](red.png)\n", 80, &hl, Some(&dir), ImageMode::None);
+        assert!(doc.images.is_empty());
+        assert!(doc.lines.iter().any(|l| l.plain().contains("🖼 local")));
+    }
+
+    #[test]
+    fn kitty_escape_sequences_are_well_formed() {
+        let mut buf = Vec::new();
+        crate::kitty::transmit(&mut buf, 3, b"12345").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.starts_with("\x1b_Ga=t,i=3,f=100,t=d,q=2,m=0;"), "{s:?}");
+        assert!(s.ends_with("\x1b\\"));
+
+        let mut buf = Vec::new();
+        crate::kitty::place(&mut buf, 3, 10, 5).unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "\x1b_Ga=p,U=1,i=3,p=1,c=10,r=5,q=2\x1b\\"
+        );
+
+        let cell = crate::kitty::placeholder_cell(0, 1).unwrap();
+        let chars: Vec<char> = cell.chars().collect();
+        assert_eq!(chars[0], crate::kitty::PLACEHOLDER);
+        assert_eq!(chars[1], '\u{0305}'); // row 0
+        assert_eq!(chars[2], '\u{030D}'); // col 1
+    }
+
+    #[test]
     fn reflows_paragraph_to_width() {
         let hl = Highlighter::new("base16-ocean.dark");
         let text = "words ".repeat(40);
-        let doc = render(&text, 30, &hl);
+        let doc = render(&text, 30, &hl, None, ImageMode::None);
         for line in &doc.lines {
             assert!(line.width() <= 30, "too wide: {:?}", line.plain());
         }

@@ -7,11 +7,13 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 # use-dev-tty: kqueue cannot poll /dev/tty on macOS, which breaks reading
 # keys while stdin is a pipe (`cat foo.md | mdview`); the select()-based
 # event source handles it.
 crossterm = { version = "0.29", features = ["use-dev-tty", "libc"] }
 dirs = "6"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 serde = { version = "1", features = ["derive"] }
 syntect = "5"

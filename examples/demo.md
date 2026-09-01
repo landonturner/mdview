@@ -76,6 +76,15 @@ GitHub-style alerts get a colored bar and title:
 > [!CAUTION]
 > Advises about risks or negative outcomes.
 
+## Images
+
+In terminals that speak the kitty graphics protocol (kitty, Ghostty), local
+images render inline at full resolution — and because mdview uses the
+protocol's Unicode placeholders, they scroll just like text. Elsewhere,
+images fall back to a clickable link:
+
+![the mdview README screenshot, rendered by mdview itself](../assets/demo.png)
+
 ## Code
 
 Fenced code blocks are syntax-highlighted with syntect (theme configurable

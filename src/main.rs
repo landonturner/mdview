@@ -1,4 +1,5 @@
 mod config;
+mod kitty;
 mod pager;
 mod render;
 mod text;
@@ -82,14 +83,19 @@ fn main() -> Result<()> {
         cfg.wrap_width = w.max(20);
     }
 
-    let (source, title) = match &args.file {
+    let (source, title, base) = match &args.file {
         Some(path) if path != "-" => {
             let contents = std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
-            let name = std::path::Path::new(path)
+            let p = std::path::Path::new(path);
+            let name = p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| path.clone());
-            (contents, name)
+            let base = p
+                .canonicalize()
+                .ok()
+                .and_then(|c| c.parent().map(|d| d.to_path_buf()));
+            (contents, name, base)
         }
         _ => {
             if std::io::stdin().is_terminal() {
@@ -98,14 +104,15 @@ fn main() -> Result<()> {
             }
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf).context("reading stdin")?;
-            (buf, "(stdin)".to_string())
+            (buf, "(stdin)".to_string(), std::env::current_dir().ok())
         }
     };
+    let base = base.as_deref();
 
     let hl = render::Highlighter::new(&cfg.code_theme);
 
     if args.dump || !std::io::stdout().is_terminal() {
-        let doc = render::render(&source, cfg.wrap_width, &hl);
+        let doc = render::render(&source, cfg.wrap_width, &hl, base, render::ImageMode::None);
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         for line in &doc.lines {
             if args.dump {
@@ -118,7 +125,7 @@ fn main() -> Result<()> {
     }
 
     pager::install_panic_hook();
-    pager::run(&source, &title, &cfg, &hl)
+    pager::run(&source, &title, &cfg, &hl, base)
 }
 
 /// Handles `--config`: opens the config file in $EDITOR, seeding it with a

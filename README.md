@@ -11,7 +11,10 @@ Headings are colored and indexed, paragraphs are reflowed to a configurable
 width, fenced code blocks are syntax-highlighted, tables get box-drawing
 borders, GitHub-style admonitions (`> [!NOTE]`, `> [!WARNING]`, …) get colored
 bars and titles, and links are emitted as OSC 8 hyperlinks (clickable in
-iTerm2, Ghostty, WezTerm, kitty, and friends).
+iTerm2, Ghostty, WezTerm, kitty, and friends). In kitty and Ghostty, local
+images render inline at full resolution via the kitty graphics protocol
+(Unicode placeholders, so they scroll like text); other terminals see a
+clickable link instead.
 
 ![mdview rendering examples/demo.md](assets/demo.png)
 
