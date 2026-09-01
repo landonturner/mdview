@@ -349,10 +349,12 @@ impl<'a> Renderer<'a> {
             }
             Tag::BlockQuote(kind) => {
                 self.block_start();
-                // Emoji chosen from U+1F3xx+ (unambiguously wide) so column
-                // accounting matches what terminals draw.
+                // Mostly emoji from U+1F3xx+ (unambiguously wide) so column
+                // accounting matches what terminals draw; ℹ️ is ambiguous-width
+                // but sits at the start of a short title line where a one-cell
+                // miscount cannot affect wrapping.
                 let (color, title) = match kind {
-                    Some(BlockQuoteKind::Note) => (Color::Blue, Some("📝 Note")),
+                    Some(BlockQuoteKind::Note) => (Color::Blue, Some("ℹ️ Note")),
                     Some(BlockQuoteKind::Tip) => (Color::Green, Some("💡 Tip")),
                     Some(BlockQuoteKind::Important) => (Color::Magenta, Some("📢 Important")),
                     Some(BlockQuoteKind::Warning) => (Color::Yellow, Some("🚨 Warning")),
