@@ -27,12 +27,9 @@ work automatically); other terminals see a clickable link instead.
 |---|---|
 | ![highlighted code blocks](assets/code.png) | ![nested, ordered, and task lists](assets/lists.png) |
 
-![tables with alignment and cell truncation](assets/tables.png)
-
-And in kitty-protocol terminals, images render inline — here is mdview
-displaying its own README screenshot:
-
-![mdview rendering an image of itself](assets/inline-images.png)
+| Tables | Inline images (kitty graphics — mdview showing its own README) |
+|---|---|
+| ![tables with alignment and cell truncation](assets/tables.png) | ![mdview rendering an image of itself](assets/inline-images.png) |
 
 ## Building
 
