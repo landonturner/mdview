@@ -22,6 +22,9 @@ line breaks**.
 A hard line break\
 forces a new line mid-paragraph, like the two lines above.
 
+GitHub emoji shortcodes render as real emoji: :book: :rocket: :tada:
+:sparkles: — but stay literal in code, like `:book:`.
+
 ## Headings
 
 Level-one and level-two headings get colored underlines; deeper levels just

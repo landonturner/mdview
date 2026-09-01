@@ -162,6 +162,41 @@ fn clean_inline(text: &str) -> String {
     text.replace('\r', "").replace('\t', "    ")
 }
 
+/// Replaces GitHub-style `:shortcode:` emoji (e.g. `:book:` → 📖) in prose.
+/// Unknown candidates are left untouched, and a failed closing colon is
+/// re-considered as the opening colon of the next candidate, so text like
+/// "12:30:45" or "a : b :tada:" behaves as expected.
+fn replace_shortcodes(text: &str) -> String {
+    if !text.contains(':') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let candidate_end = after.find(':');
+        if let Some(end) = candidate_end {
+            let candidate = &after[..end];
+            let valid = !candidate.is_empty()
+                && candidate
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '+' | '-'));
+            if valid {
+                if let Some(emoji) = emojis::get_by_shortcode(candidate) {
+                    out.push_str(emoji.as_str());
+                    rest = &after[end + 1..];
+                    continue;
+                }
+            }
+        }
+        out.push(':');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn syn_to_style(syn: syntect::highlighting::Style) -> Style {
     let fg = syn.foreground;
     let mut style = Style::default().fg(Color::Rgb { r: fg.r, g: fg.g, b: fg.b });
@@ -302,7 +337,7 @@ impl<'a> Renderer<'a> {
             Event::Start(tag) => self.start_tag(tag),
             Event::End(tag) => self.end_tag(tag),
             Event::Text(t) => {
-                let text = clean_inline(&t);
+                let text = replace_shortcodes(&clean_inline(&t));
                 self.inline.push(Span::new(text, self.cur_style()));
             }
             Event::Code(t) => {
@@ -1007,6 +1042,29 @@ mod tests {
             .filter(|l| l.plain().chars().all(|c| c.is_whitespace() || c == QUOTE_BAR))
             .count();
         assert_eq!(blanks, 1, "{:?}", doc.lines.iter().map(|l| l.plain()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn expands_emoji_shortcodes_in_prose_but_not_code() {
+        assert_eq!(replace_shortcodes("I :book: it :tada:"), "I 📖 it 🎉");
+        assert_eq!(replace_shortcodes(":notarealemoji: stays"), ":notarealemoji: stays");
+        assert_eq!(replace_shortcodes("meet at 12:30:45"), "meet at 12:30:45");
+        assert_eq!(replace_shortcodes("a : b :tada:"), "a : b 🎉");
+        assert_eq!(replace_shortcodes("+1: :+1:"), "+1: 👍");
+
+        let hl = Highlighter::new("base16-ocean.dark");
+        let doc = render(
+            "prose :book: and `code :book:`\n\n```\nblock :book:\n```\n",
+            80,
+            &hl,
+            None,
+            ImageMode::None,
+            true,
+        );
+        let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
+        assert!(text.iter().any(|l| l.contains("prose 📖")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("code :book:")), "{text:?}");
+        assert!(text.iter().any(|l| l.contains("block :book:")), "{text:?}");
     }
 
     #[test]
