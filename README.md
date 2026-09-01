@@ -11,14 +11,28 @@ Headings are colored and indexed, paragraphs are reflowed to a configurable
 width, fenced code blocks are syntax-highlighted, tables get box-drawing
 borders, GitHub-style admonitions (`> [!NOTE]`, `> [!WARNING]`, …) get colored
 bars and titles, and links are emitted as OSC 8 hyperlinks (clickable in
-iTerm2, Ghostty, WezTerm, kitty, and friends). In kitty and Ghostty, local
-images render inline at full resolution via the kitty graphics protocol
-(Unicode placeholders, so they scroll like text); other terminals see a
-clickable link instead.
+iTerm2, Ghostty, WezTerm, kitty, and friends). Local images render inline at
+full resolution in any terminal that implements the kitty graphics protocol
+with Unicode placeholders (kitty and Ghostty among them — mdview probes the
+terminal at startup rather than checking names, so protocol-capable terminals
+work automatically); other terminals see a clickable link instead.
 
 ![mdview rendering examples/demo.md](assets/demo.png)
 
-![tables, code, and footnotes rendered by mdview](assets/tables.png)
+| Admonitions | Diagrams & math (```` ```mermaid ````, ```` ```latex ````) |
+|---|---|
+| ![GitHub-style admonitions](assets/admonitions.png) | ![mermaid diagram and LaTeX math rendered inline](assets/diagrams.png) |
+
+| Syntax-highlighted code | Lists & task lists |
+|---|---|
+| ![highlighted code blocks](assets/code.png) | ![nested, ordered, and task lists](assets/lists.png) |
+
+![tables with alignment and cell truncation](assets/tables.png)
+
+And in kitty-protocol terminals, images render inline — here is mdview
+displaying its own README screenshot:
+
+![mdview rendering an image of itself](assets/inline-images.png)
 
 ## Building
 
@@ -42,6 +56,7 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `n` / `N`      | next / previous match               |
 | `]` / `[`      | next / previous heading             |
 | `t`            | table of contents overlay           |
+| `v`            | toggle diagrams rendered / as source |
 | `h`            | help                                |
 | `q`            | quit                                |
 
@@ -59,6 +74,7 @@ Counts work like less: `10j`, `5k`, `42g`.
 -w, --width <N>   reflow paragraphs to at most N columns (this run only)
 -d, --dump        print the rendered document (with ANSI styling) and exit
 -c, --config      open the config file in $EDITOR
+    --clear-cache delete the rendered-diagram cache (mermaid/LaTeX)
 ```
 
 When stdout is not a terminal, mdview prints the rendered document as plain
@@ -79,6 +95,10 @@ wrap_width = 80
 # base16-mocha.dark, base16-ocean.light, InspiredGitHub, Solarized (dark),
 # Solarized (light)
 code_theme = "base16-ocean.dark"
+
+# How mermaid/latex blocks start out: "rendered" diagrams, or their "text"
+# source (toggle with v).
+default_view = "rendered"
 ```
 
-Both keys are optional; `--width` overrides the file.
+All keys are optional; `--width` overrides the file.
