@@ -12,6 +12,8 @@ width, fenced code blocks are syntax-highlighted, tables get box-drawing
 borders, and links are emitted as OSC 8 hyperlinks (clickable in iTerm2,
 Ghostty, WezTerm, kitty, and friends).
 
+![mdview rendering examples/demo.md](assets/demo.png)
+
 ## Building
 
 The Rust toolchain is pinned via [mise](https://mise.jdx.dev) (`mise.toml`):
@@ -38,6 +40,12 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `q`            | quit                                |
 
 Counts work like less: `10j`, `5k`, `42g`.
+
+`t` opens the table of contents; `h` shows the key reference:
+
+| `t` — table of contents | `h` — help |
+|---|---|
+| ![table of contents overlay](assets/toc.png) | ![help overlay](assets/help.png) |
 
 ## Options
 
