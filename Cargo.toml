@@ -4,6 +4,7 @@ version = "1.2.0"
 edition = "2021"
 description = "A less-style terminal pager that renders markdown readably"
 license = "MIT"
+repository = "https://github.com/landonturner/markdown"
 
 [dependencies]
 anyhow = "1"
@@ -27,3 +28,8 @@ ureq = { version = "2.12", default-features = false, features = ["tls"] }
 [profile.release]
 lto = true
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
