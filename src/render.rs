@@ -349,12 +349,14 @@ impl<'a> Renderer<'a> {
             }
             Tag::BlockQuote(kind) => {
                 self.block_start();
+                // Emoji chosen from U+1F3xx+ (unambiguously wide) so column
+                // accounting matches what terminals draw.
                 let (color, title) = match kind {
-                    Some(BlockQuoteKind::Note) => (Color::Blue, Some("Note")),
-                    Some(BlockQuoteKind::Tip) => (Color::Green, Some("Tip")),
-                    Some(BlockQuoteKind::Important) => (Color::Magenta, Some("Important")),
-                    Some(BlockQuoteKind::Warning) => (Color::Yellow, Some("Warning")),
-                    Some(BlockQuoteKind::Caution) => (Color::Red, Some("Caution")),
+                    Some(BlockQuoteKind::Note) => (Color::Blue, Some("📝 Note")),
+                    Some(BlockQuoteKind::Tip) => (Color::Green, Some("💡 Tip")),
+                    Some(BlockQuoteKind::Important) => (Color::Magenta, Some("📢 Important")),
+                    Some(BlockQuoteKind::Warning) => (Color::Yellow, Some("🚨 Warning")),
+                    Some(BlockQuoteKind::Caution) => (Color::Red, Some("🛑 Caution")),
                     None => (Color::DarkGreen, None),
                 };
                 self.prefixes.push(Prefix {
