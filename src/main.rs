@@ -129,9 +129,14 @@ fn main() -> Result<()> {
         let doc =
             render::render(&source, cfg.wrap_width, &hl, base, render::ImageMode::None, true);
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        // --dump mirrors what the pager shows, margin included; the plain
+        // fallback stays flush-left so `mdview foo.md | grep ...` output is
+        // predictable.
+        let margin = " ".repeat(cfg.left_margin.min(16));
         for line in &doc.lines {
             if args.dump {
-                writeln!(out, "{}", line_ansi(line))?;
+                let pad = if line.spans.is_empty() { "" } else { margin.as_str() };
+                writeln!(out, "{pad}{}", line_ansi(line))?;
             } else {
                 writeln!(out, "{}", line.plain())?;
             }

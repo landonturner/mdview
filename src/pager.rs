@@ -431,8 +431,12 @@ impl<'a> Pager<'a> {
     fn draw(&mut self, out: &mut io::Stdout) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate)?;
         let rows = self.content_h();
+        let margin = effective_margin(self.cfg, self.w);
         for row in 0..rows {
             queue!(out, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
+            // Content (including kitty image placeholder cells) starts at the
+            // margin; the status bar and overlays keep absolute coordinates.
+            queue!(out, cursor::MoveTo(margin, row as u16))?;
             let idx = self.top + row;
             if idx < self.lines().len() {
                 self.draw_line(out, idx)?;
@@ -469,7 +473,7 @@ impl<'a> Pager<'a> {
             None => Vec::new(),
         };
 
-        let max = self.w as usize;
+        let max = (self.w - effective_margin(self.cfg, self.w)) as usize;
         let mut col = 0usize;
         let mut offset = 0usize; // byte offset into the line's plain text
         'spans: for span in &line.spans {
@@ -673,8 +677,15 @@ fn detect_image_mode() -> ImageMode {
     }
 }
 
+/// The configured left margin, shrunk toward 0 on terminals too narrow to
+/// afford it while keeping at least 20 columns of text.
+fn effective_margin(cfg: &Config, term_w: u16) -> u16 {
+    (cfg.left_margin as u16).min(term_w.saturating_sub(20))
+}
+
 fn wrap_width(cfg: &Config, term_w: u16) -> usize {
-    cfg.wrap_width.min(term_w as usize).max(20)
+    let usable = term_w.saturating_sub(effective_margin(cfg, term_w));
+    cfg.wrap_width.min(usable as usize).max(20)
 }
 
 /// Truncates a string to at most `max` display columns.

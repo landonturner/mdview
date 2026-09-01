@@ -10,6 +10,10 @@ pub struct Config {
     /// Maximum column paragraphs are reflowed to. The effective width is the
     /// smaller of this and the terminal width.
     pub wrap_width: usize,
+    /// Columns of blank margin at the left edge of the pager and --dump
+    /// output. Applied at print time; reflow width is computed so text still
+    /// fits the terminal.
+    pub left_margin: usize,
     /// Syntect theme used for fenced code blocks.
     pub code_theme: String,
     /// How mermaid/latex blocks start out: "rendered" as diagrams, or as
@@ -21,6 +25,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             wrap_width: 80,
+            left_margin: 2,
             code_theme: "base16-ocean.dark".to_string(),
             default_view: "rendered".to_string(),
         }
@@ -60,6 +65,9 @@ pub const TEMPLATE: &str = r#"# mdview configuration
 # Paragraphs reflow to at most this many columns (capped at the terminal width).
 wrap_width = 80
 
+# Blank columns at the left edge (shrinks to 0 on very narrow terminals).
+left_margin = 2
+
 # Theme for fenced code blocks. One of:
 #   base16-ocean.dark, base16-eighties.dark, base16-mocha.dark,
 #   base16-ocean.light, InspiredGitHub, Solarized (dark), Solarized (light)
@@ -78,6 +86,9 @@ pub fn check(path: &std::path::Path) -> Result<Config> {
     let cfg: Config = toml::from_str(&contents)?;
     if cfg.wrap_width < 20 {
         bail!("wrap_width must be at least 20");
+    }
+    if cfg.left_margin > 16 {
+        bail!("left_margin must be at most 16");
     }
     if !["rendered", "text"].contains(&cfg.default_view.as_str()) {
         bail!("default_view must be \"rendered\" or \"text\"");

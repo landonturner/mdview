@@ -31,6 +31,22 @@ work automatically); other terminals see a clickable link instead.
 |---|---|
 | ![tables with alignment and cell truncation](assets/tables.png) | ![mdview rendering an image of itself](assets/inline-images.png) |
 
+## Installing
+
+Shell installer (macOS or Linux, no toolchain needed):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/landonturner/markdown/releases/latest/download/mdview-installer.sh | sh
+```
+
+With [mise](https://mise.jdx.dev) (verifies SLSA build provenance):
+
+```sh
+mise use -g "github:landonturner/markdown[exe=mdview]@latest"
+```
+
+Or from source: `cargo install --git https://github.com/landonturner/markdown`
+
 ## Building
 
 The Rust toolchain is pinned via [mise](https://mise.jdx.dev) (`mise.toml`):
@@ -87,6 +103,9 @@ editor closes:
 ```toml
 # Paragraphs reflow to at most this many columns (capped at the terminal width).
 wrap_width = 80
+
+# Blank columns at the left edge (shrinks to 0 on very narrow terminals).
+left_margin = 2
 
 # Any syntect default theme: base16-ocean.dark, base16-eighties.dark,
 # base16-mocha.dark, base16-ocean.light, InspiredGitHub, Solarized (dark),
