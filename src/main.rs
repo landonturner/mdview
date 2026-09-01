@@ -126,8 +126,17 @@ fn main() -> Result<()> {
     let hl = render::Highlighter::new(&cfg.code_theme);
 
     if args.dump || !std::io::stdout().is_terminal() {
-        let doc =
-            render::render(&source, cfg.wrap_width, &hl, base, render::ImageMode::None, true);
+        let doc = render::render(
+            &source,
+            &hl,
+            &render::RenderOpts {
+                width: cfg.wrap_width,
+                base,
+                image_mode: render::ImageMode::None,
+                diagrams: true,
+                resolve_links: args.file.is_some(),
+            },
+        );
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
         // --dump mirrors what the pager shows, margin included; the plain
         // fallback stays flush-left so `mdview foo.md | grep ...` output is
@@ -145,7 +154,10 @@ fn main() -> Result<()> {
     }
 
     pager::install_panic_hook();
-    pager::run(&source, &title, &cfg, &hl, base)
+    // stdin's base is only a cwd guess, so relative links stay unresolved
+    // there rather than pointing at the wrong files.
+    let resolve_links = args.file.is_some();
+    pager::run(&source, &title, &cfg, &hl, base, resolve_links)
 }
 
 /// Handles `--config`: opens the config file in $EDITOR, seeding it with a
@@ -192,7 +204,9 @@ fn line_ansi(line: &Line) -> String {
     let mut out = String::new();
     for span in &line.spans {
         let codes = style_codes(&span.style);
-        if let Some(url) = &span.style.link {
+        // Internal #fragments aren't openable by the terminal; skip OSC 8.
+        let osc8 = span.style.link.as_deref().filter(|u| !u.starts_with('#'));
+        if let Some(url) = osc8 {
             out.push_str(&format!("\x1b]8;;{url}\x1b\\"));
         }
         if codes.is_empty() {
@@ -200,7 +214,7 @@ fn line_ansi(line: &Line) -> String {
         } else {
             out.push_str(&format!("\x1b[{}m{}\x1b[0m", codes.join(";"), span.text));
         }
-        if span.style.link.is_some() {
+        if osc8.is_some() {
             out.push_str("\x1b]8;;\x1b\\");
         }
     }

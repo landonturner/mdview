@@ -66,14 +66,24 @@ impl Highlighter {
     }
 }
 
-pub fn render(
-    source: &str,
-    width: usize,
-    hl: &Highlighter,
-    base: Option<&Path>,
-    image_mode: ImageMode,
-    diagrams: bool,
-) -> Document {
+/// Everything that shapes a render besides the source itself.
+#[derive(Clone, Copy)]
+pub struct RenderOpts<'a> {
+    pub width: usize,
+    /// Directory the document lives in; resolves relative image and link
+    /// targets.
+    pub base: Option<&'a Path>,
+    pub image_mode: ImageMode,
+    /// When false, mermaid/latex blocks stay syntax-highlighted code.
+    pub diagrams: bool,
+    /// Resolve relative links against `base`. Off for stdin, where base is
+    /// only a guess at the working directory — a wrong file:// link is worse
+    /// than an inert one.
+    pub resolve_links: bool,
+}
+
+pub fn render(source: &str, hl: &Highlighter, opts: &RenderOpts) -> Document {
+    let RenderOpts { width, base, image_mode, diagrams, resolve_links } = *opts;
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -87,6 +97,7 @@ pub fn render(
         base,
         image_mode,
         diagrams,
+        resolve_links,
         images: Vec::new(),
         lines: Vec::new(),
         headings: Vec::new(),
@@ -143,6 +154,7 @@ struct Renderer<'a> {
     image_mode: ImageMode,
     /// When false, mermaid/latex blocks stay syntax-highlighted code.
     diagrams: bool,
+    resolve_links: bool,
     images: Vec<KittyImage>,
     lines: Vec<Line>,
     headings: Vec<Heading>,
@@ -215,6 +227,23 @@ fn syn_to_style(syn: syntect::highlighting::Style) -> Style {
     style.italic = syn.font_style.contains(FontStyle::ITALIC);
     style.underline = syn.font_style.contains(FontStyle::UNDERLINE);
     style
+}
+
+/// True for `scheme:` prefixes per RFC 3986 (https://, mailto:, etc.).
+pub fn has_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    for c in chars {
+        match c {
+            ':' => return true,
+            c if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') => {}
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn heading_level(level: HeadingLevel) -> u8 {
@@ -506,7 +535,7 @@ impl<'a> Renderer<'a> {
                 let mut s = self.cur_style();
                 s.fg = Some(LINK_COLOR);
                 s.underline = true;
-                s.link = Some(dest_url.to_string());
+                s.link = self.resolve_link(&dest_url);
                 self.styles.push(s);
             }
             Tag::Image { dest_url, .. } => {
@@ -596,6 +625,38 @@ impl<'a> Renderer<'a> {
             TagEnd::HtmlBlock => self.flush_inline(),
             _ => {}
         }
+    }
+
+    /// Turns a markdown link destination into a followable URI. Relative
+    /// paths become file:// URIs against `base` (what image resolution
+    /// already does); fragment-only links stay internal; anything with a
+    /// scheme passes through.
+    fn resolve_link(&self, dest: &str) -> Option<String> {
+        if dest.is_empty() {
+            return None;
+        }
+        if dest.starts_with('#') || has_scheme(dest) || !self.resolve_links {
+            return Some(dest.to_string());
+        }
+        let (path_part, fragment) = match dest.split_once('#') {
+            Some((p, f)) => (p, Some(f)),
+            None => (dest, None),
+        };
+        let path = Path::new(path_part);
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            match self.base {
+                Some(base) => base.join(path),
+                None => return Some(dest.to_string()),
+            }
+        };
+        let mut uri = format!("file://{}", abs.display());
+        if let Some(f) = fragment {
+            uri.push('#');
+            uri.push_str(f);
+        }
+        Some(uri)
     }
 
     /// Emits an image as kitty Unicode-placeholder cells when the terminal
@@ -989,6 +1050,16 @@ pub fn wrap_spans(spans: &[Span], width: usize) -> Vec<Vec<Span>> {
 mod tests {
     use super::*;
 
+    fn topts(width: usize) -> RenderOpts<'static> {
+        RenderOpts {
+            width,
+            base: None,
+            image_mode: ImageMode::None,
+            diagrams: true,
+            resolve_links: true,
+        }
+    }
+
     fn plain(lines: &[Vec<Span>]) -> Vec<String> {
         lines
             .iter()
@@ -1029,7 +1100,7 @@ mod tests {
     #[test]
     fn renders_headings_into_index() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("# One\n\ntext\n\n## Two\n", 80, &hl, None, ImageMode::None, true);
+        let doc = render("# One\n\ntext\n\n## Two\n", &hl, &topts(80));
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].text, "One");
         assert_eq!(doc.headings[1].level, 2);
@@ -1038,7 +1109,7 @@ mod tests {
     #[test]
     fn expands_tabs_in_inline_text() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("a\tb and `c\td`\n", 80, &hl, None, ImageMode::None, true);
+        let doc = render("a\tb and `c\td`\n", &hl, &topts(80));
         for line in &doc.lines {
             assert!(!line.plain().contains('\t'), "raw tab in {:?}", line.plain());
         }
@@ -1047,7 +1118,7 @@ mod tests {
     #[test]
     fn no_double_blank_between_nested_quote_paragraphs() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("> > one\n> >\n> > two\n", 80, &hl, None, ImageMode::None, true);
+        let doc = render("> > one\n> >\n> > two\n", &hl, &topts(80));
         let blanks = doc
             .lines
             .iter()
@@ -1070,11 +1141,8 @@ mod tests {
         let hl = Highlighter::new("base16-ocean.dark");
         let doc = render(
             "prose :book: and `code :book:`\n\n```\nblock :book:\n```\n",
-            80,
             &hl,
-            None,
-            ImageMode::None,
-            true,
+            &topts(80),
         );
         let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
         assert!(text.iter().any(|l| l.contains("prose 📖")), "{text:?}");
@@ -1082,10 +1150,70 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("block :book:")), "{text:?}");
     }
 
+    fn links_of(doc: &Document) -> Vec<String> {
+        doc.lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| s.style.link.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn resolves_relative_links_against_base() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        let base = Path::new("/repo/docs");
+        let md = "\
+[rel](guide/setup.md) [abs](/etc/motd) [frag](#usage) [web](https://x.dev) \
+<https://auto.link> [mail](mailto:a@b.c) [rf][1]\n\n[1]: sub/ref.md\n\n\
+| [in table](t.md) |\n|---|\n| x |\n\n> [!NOTE]\n> [in note](n.md)\n";
+        let doc = render(md, &hl, &RenderOpts { base: Some(base), ..topts(120) });
+        let links = links_of(&doc);
+        assert!(links.contains(&"file:///repo/docs/guide/setup.md".into()), "{links:?}");
+        assert!(links.contains(&"file:///etc/motd".into()), "{links:?}");
+        assert!(links.contains(&"#usage".into()), "{links:?}");
+        assert!(links.contains(&"https://x.dev".into()), "{links:?}");
+        assert!(links.contains(&"https://auto.link".into()), "{links:?}");
+        assert!(links.contains(&"mailto:a@b.c".into()), "{links:?}");
+        assert!(links.contains(&"file:///repo/docs/sub/ref.md".into()), "{links:?}");
+        assert!(links.contains(&"file:///repo/docs/t.md".into()), "{links:?}");
+        assert!(links.contains(&"file:///repo/docs/n.md".into()), "{links:?}");
+    }
+
+    #[test]
+    fn relative_links_stay_verbatim_without_trusted_base() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        // stdin: resolve_links off even though a cwd base exists
+        let opts = RenderOpts {
+            base: Some(Path::new("/somewhere")),
+            resolve_links: false,
+            ..topts(80)
+        };
+        let doc = render("[rel](docs/x.md) with a fragment [f](#top)\n", &hl, &opts);
+        let links = links_of(&doc);
+        assert!(links.contains(&"docs/x.md".into()), "{links:?}");
+        assert!(links.contains(&"#top".into()), "{links:?}");
+        // no base at all: also verbatim
+        let doc = render("[rel](docs/x.md)\n", &hl, &topts(80));
+        assert!(links_of(&doc).contains(&"docs/x.md".into()));
+    }
+
+    #[test]
+    fn resolved_link_keeps_fragment() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        let doc = render(
+            "[s](other.md#install)\n",
+            &hl,
+            &RenderOpts { base: Some(Path::new("/d")), ..topts(80) },
+        );
+        assert!(links_of(&doc).contains(&"file:///d/other.md#install".into()));
+    }
+
     #[test]
     fn renders_admonition_title() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render("> [!WARNING]\n> Careful here.\n", 80, &hl, None, ImageMode::None, true);
+        let doc = render("> [!WARNING]\n> Careful here.\n", &hl, &topts(80));
         let text: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
         assert!(text.iter().any(|l| l.contains("Warning")), "{text:?}");
         assert!(text.iter().any(|l| l.contains("Careful here.")), "{text:?}");
@@ -1102,14 +1230,18 @@ mod tests {
         img.save(dir.join("red.png")).unwrap();
 
         let hl = Highlighter::new("base16-ocean.dark");
-        let kitty = ImageMode::Kitty { cell_w: 8, cell_h: 16 };
-        let doc = render("![a red square](red.png)\n", 80, &hl, Some(&dir), kitty, true);
+        let kitty = RenderOpts {
+            base: Some(&dir),
+            image_mode: ImageMode::Kitty { cell_w: 8, cell_h: 16 },
+            ..topts(80)
+        };
+        let doc = render("![a red square](red.png)\n", &hl, &kitty);
         assert_eq!(doc.images.len(), 1);
         let img = &doc.images[0];
         assert_eq!((img.cols, img.rows), (4, 4));
         // Content-derived id: 24-bit, nonzero, stable across renders.
         assert!(img.id > 0 && img.id <= 0xFF_FFFF);
-        let again = render("![a red square](red.png)\n", 80, &hl, Some(&dir), kitty, true);
+        let again = render("![a red square](red.png)\n", &hl, &kitty);
         assert_eq!(again.images[0].id, img.id);
         assert!(!img.png.is_empty());
         let placeholder_rows = doc
@@ -1122,10 +1254,10 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("a red square")), "{text:?}");
 
         // Remote URLs and ImageMode::None fall back to a link.
-        let doc = render("![remote](https://example.com/x.png)\n", 80, &hl, Some(&dir), kitty, true);
+        let doc = render("![remote](https://example.com/x.png)\n", &hl, &kitty);
         assert!(doc.images.is_empty());
         assert!(doc.lines.iter().any(|l| l.plain().contains("🖼 remote")));
-        let doc = render("![local](red.png)\n", 80, &hl, Some(&dir), ImageMode::None, true);
+        let doc = render("![local](red.png)\n", &hl, &RenderOpts { base: Some(&dir), ..topts(80) });
         assert!(doc.images.is_empty());
         assert!(doc.lines.iter().any(|l| l.plain().contains("🖼 local")));
     }
@@ -1133,14 +1265,7 @@ mod tests {
     #[test]
     fn mermaid_block_stays_code_without_graphics() {
         let hl = Highlighter::new("base16-ocean.dark");
-        let doc = render(
-            "```mermaid\nflowchart LR\n  A --> B\n```\n",
-            80,
-            &hl,
-            None,
-            ImageMode::None,
-            true,
-        );
+        let doc = render("```mermaid\nflowchart LR\n  A --> B\n```\n", &hl, &topts(80));
         assert!(doc.images.is_empty());
         assert!(doc.lines.iter().any(|l| l.plain().contains("A --> B")));
     }
@@ -1171,7 +1296,7 @@ mod tests {
     fn reflows_paragraph_to_width() {
         let hl = Highlighter::new("base16-ocean.dark");
         let text = "words ".repeat(40);
-        let doc = render(&text, 30, &hl, None, ImageMode::None, true);
+        let doc = render(&text, &hl, &topts(30));
         for line in &doc.lines {
             assert!(line.width() <= 30, "too wide: {:?}", line.plain());
         }

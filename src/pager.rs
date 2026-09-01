@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::render::{render, Document, Highlighter, ImageMode};
+use crate::render::{render, Document, Highlighter, ImageMode, RenderOpts};
 use crate::text::{Line, Style};
 use anyhow::Result;
 use crossterm::{
@@ -13,6 +13,7 @@ use crossterm::{
     },
 };
 use std::io::{self, Write};
+use std::path::Path;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub fn run(
@@ -21,6 +22,7 @@ pub fn run(
     cfg: &Config,
     hl: &Highlighter,
     base: Option<&std::path::Path>,
+    resolve_links: bool,
 ) -> Result<()> {
     let mut out = io::stdout();
     enable_raw_mode()?;
@@ -28,7 +30,9 @@ pub fn run(
     // alternate screen fails, raw mode must not leak to the shell.
     let result = execute!(out, EnterAlternateScreen, cursor::Hide)
         .map_err(Into::into)
-        .and_then(|_| Pager::new(source, title, cfg, hl, base).main_loop(&mut out));
+        .and_then(|_| {
+            Pager::new(source, title, cfg, hl, base, resolve_links).main_loop(&mut out)
+        });
     let _ = crate::kitty::delete_all(&mut out);
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();
@@ -51,6 +55,26 @@ enum Mode {
     Prompt { backward: bool, buf: String },
     Toc { sel: usize },
     Help,
+    /// Link-follow: labels overlaid on the visible links; next key picks one.
+    Follow { targets: Vec<LinkTarget> },
+}
+
+/// One followable link currently on screen.
+struct LinkTarget {
+    label: char,
+    /// Screen row (0-based, within the content area).
+    row: u16,
+    /// Display column of the link's first cell, before the margin shift.
+    col: u16,
+    url: String,
+}
+
+/// A document the user navigated away from, for the back stack.
+struct HistoryEntry {
+    source: String,
+    title: String,
+    base: Option<std::path::PathBuf>,
+    top: usize,
 }
 
 struct Search {
@@ -61,11 +85,13 @@ struct Search {
 }
 
 struct Pager<'a> {
-    source: &'a str,
+    source: String,
     title: String,
     cfg: &'a Config,
     hl: &'a Highlighter,
-    base: Option<&'a std::path::Path>,
+    base: Option<std::path::PathBuf>,
+    resolve_links: bool,
+    back_stack: Vec<HistoryEntry>,
     image_mode: ImageMode,
     /// Image ids already transmitted to the terminal this session.
     transmitted: std::collections::HashSet<u32>,
@@ -87,22 +113,35 @@ struct Pager<'a> {
 
 impl<'a> Pager<'a> {
     fn new(
-        source: &'a str,
+        source: &str,
         title: &str,
         cfg: &'a Config,
         hl: &'a Highlighter,
-        base: Option<&'a std::path::Path>,
+        base: Option<&std::path::Path>,
+        resolve_links: bool,
     ) -> Self {
         let (w, h) = term_size();
         let image_mode = detect_image_mode();
         let diagrams = cfg.default_view != "text";
-        let doc = render(source, wrap_width(cfg, w), hl, base, image_mode, diagrams);
-        Self {
+        let doc = render(
             source,
+            hl,
+            &RenderOpts {
+                width: wrap_width(cfg, w),
+                base,
+                image_mode,
+                diagrams,
+                resolve_links,
+            },
+        );
+        Self {
+            source: source.to_string(),
             title: title.to_string(),
             cfg,
             hl,
-            base,
+            base: base.map(|p| p.to_path_buf()),
+            resolve_links,
+            back_stack: Vec::new(),
             image_mode,
             transmitted: std::collections::HashSet::new(),
             doc,
@@ -123,20 +162,23 @@ impl<'a> Pager<'a> {
         &self.doc.lines
     }
 
+    fn render_opts(&self) -> RenderOpts<'_> {
+        RenderOpts {
+            width: wrap_width(self.cfg, self.w),
+            base: self.base.as_deref(),
+            image_mode: self.image_mode,
+            diagrams: self.diagrams,
+            resolve_links: self.resolve_links,
+        }
+    }
+
     /// Toggles mermaid/latex blocks between rendered diagrams and their
     /// source, keeping the viewport position proportionally.
     fn toggle_diagrams(&mut self) {
         let old_len = self.lines().len().max(1);
         let frac = self.top as f64 / old_len as f64;
         self.diagrams = !self.diagrams;
-        self.doc = render(
-            self.source,
-            wrap_width(self.cfg, self.w),
-            self.hl,
-            self.base,
-            self.image_mode,
-            self.diagrams,
-        );
+        self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
         self.images_stale = true;
         self.research();
@@ -188,6 +230,7 @@ impl<'a> Pager<'a> {
                             Mode::Prompt { .. } => self.key_prompt(key),
                             Mode::Toc { .. } => self.key_toc(key),
                             Mode::Help => self.mode = Mode::Normal,
+                            Mode::Follow { .. } => self.key_follow(key),
                         }
                         changed = true;
                     }
@@ -224,14 +267,7 @@ impl<'a> Pager<'a> {
         self.w = if w == 0 { 80 } else { w };
         self.h = if h == 0 { 24 } else { h };
         self.image_mode = detect_image_mode();
-        self.doc = render(
-            self.source,
-            wrap_width(self.cfg, self.w),
-            self.hl,
-            self.base,
-            self.image_mode,
-            self.diagrams,
-        );
+        self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
         self.research();
     }
@@ -302,6 +338,9 @@ impl<'a> Pager<'a> {
                 }
             }
             KeyCode::Char('v') => self.toggle_diagrams(),
+            KeyCode::Char('o') if ctrl => self.go_back(),
+            KeyCode::Char('o') => self.enter_follow_mode(),
+            KeyCode::Backspace => self.go_back(),
             KeyCode::Char('/') => self.mode = Mode::Prompt { backward: false, buf: String::new() },
             KeyCode::Char('?') => self.mode = Mode::Prompt { backward: true, buf: String::new() },
             KeyCode::Char('n') => self.next_match(1),
@@ -367,6 +406,142 @@ impl<'a> Pager<'a> {
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => self.mode = Mode::Normal,
             _ => {}
+        }
+    }
+
+    /// Collects the links visible on screen and overlays selection labels.
+    fn enter_follow_mode(&mut self) {
+        const LABELS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        let visible_w = (self.w - effective_margin(self.cfg, self.w)) as usize;
+        let mut targets: Vec<LinkTarget> = Vec::new();
+        'rows: for row in 0..self.content_h() {
+            let Some(line) = self.lines().get(self.top + row) else { break };
+            let mut col = 0usize;
+            let mut prev: Option<&str> = None;
+            for span in &line.spans {
+                if col >= visible_w {
+                    break;
+                }
+                if let Some(url) = &span.style.link {
+                    if prev != Some(url.as_str()) {
+                        if targets.len() >= LABELS.len() {
+                            break 'rows;
+                        }
+                        targets.push(LinkTarget {
+                            label: LABELS[targets.len()] as char,
+                            row: row as u16,
+                            col: col as u16,
+                            url: url.clone(),
+                        });
+                    }
+                }
+                prev = span.style.link.as_deref();
+                col += span.width();
+            }
+        }
+        if targets.is_empty() {
+            self.message = Some("No links on screen".into());
+        } else {
+            self.mode = Mode::Follow { targets };
+        }
+    }
+
+    fn key_follow(&mut self, key: KeyEvent) {
+        let Mode::Follow { targets } = std::mem::replace(&mut self.mode, Mode::Normal) else {
+            return;
+        };
+        if let KeyCode::Char(c) = key.code {
+            if let Some(t) = targets.into_iter().find(|t| t.label == c) {
+                self.follow_link(&t.url);
+            }
+        }
+    }
+
+    /// Dispatches a followed link by target kind.
+    fn follow_link(&mut self, url: &str) {
+        if let Some(fragment) = url.strip_prefix('#') {
+            self.jump_fragment(fragment);
+            return;
+        }
+        if let Some(path) = url.strip_prefix("file://") {
+            let (path, fragment) = match path.split_once('#') {
+                Some((p, f)) => (p, Some(f.to_string())),
+                None => (path, None),
+            };
+            let is_md = Path::new(path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+            if is_md {
+                self.navigate_to(Path::new(path), fragment.as_deref());
+                return;
+            }
+            if !Path::new(path).exists() {
+                self.message = Some(format!("Not found: {path}"));
+                return;
+            }
+        }
+        open_external(url, &mut self.message);
+    }
+
+    /// Loads another markdown file into the pager, pushing the current
+    /// document onto the back stack.
+    fn navigate_to(&mut self, path: &Path, fragment: Option<&str>) {
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(err) => {
+                self.message = Some(format!("{}: {err}", path.display()));
+                return;
+            }
+        };
+        let title = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let base = path.canonicalize().ok().and_then(|c| c.parent().map(|d| d.to_path_buf()));
+        self.back_stack.push(HistoryEntry {
+            source: std::mem::take(&mut self.source),
+            title: std::mem::replace(&mut self.title, title),
+            base: std::mem::replace(&mut self.base, base),
+            top: self.top,
+        });
+        self.source = source;
+        self.resolve_links = true; // navigated docs always have a real base
+        self.doc = render(&self.source, self.hl, &self.render_opts());
+        self.top = 0;
+        self.search = None;
+        self.images_stale = true;
+        if let Some(f) = fragment {
+            self.jump_fragment(f);
+        }
+    }
+
+    /// Pops the back stack, restoring the previous document and position.
+    fn go_back(&mut self) {
+        let Some(prev) = self.back_stack.pop() else {
+            self.message = Some("No previous document".into());
+            return;
+        };
+        self.source = prev.source;
+        self.title = prev.title;
+        self.base = prev.base;
+        self.doc = render(&self.source, self.hl, &self.render_opts());
+        self.top = prev.top.min(self.max_top());
+        self.search = None;
+        self.images_stale = true;
+    }
+
+    /// Jumps to the heading whose GitHub-style slug (or text) matches.
+    fn jump_fragment(&mut self, fragment: &str) {
+        let want = fragment.to_ascii_lowercase();
+        let found = self
+            .doc
+            .headings
+            .iter()
+            .find(|h| slugify(&h.text) == want || h.text.eq_ignore_ascii_case(fragment))
+            .map(|h| h.line);
+        match found {
+            Some(line) => self.top = line.min(self.max_top()),
+            None => self.message = Some(format!("No heading #{fragment}")),
         }
     }
 
@@ -450,9 +625,24 @@ impl<'a> Pager<'a> {
             }
         }
         self.draw_status(out)?;
-        match self.mode {
+        match &self.mode {
             Mode::Toc { .. } => self.draw_toc(out)?,
             Mode::Help => self.draw_help(out)?,
+            Mode::Follow { targets } => {
+                // Labels overwrite the link's first cell only. Kitty image
+                // placeholder lines carry no link styles, so placeholder
+                // cells are never touched.
+                for t in targets {
+                    queue!(
+                        out,
+                        cursor::MoveTo(margin + t.col, t.row),
+                        SetAttribute(Attribute::Reverse),
+                        SetAttribute(Attribute::Bold),
+                        Print(t.label),
+                        SetAttribute(Attribute::Reset)
+                    )?;
+                }
+            }
             _ => {}
         }
         queue!(out, EndSynchronizedUpdate)?;
@@ -585,6 +775,8 @@ impl<'a> Pager<'a> {
             ("] / [", "next / previous heading"),
             ("t", "table of contents"),
             ("v", "show diagrams rendered / as source"),
+            ("o", "follow a link (labels appear)"),
+            ("BKSP / ^o", "back to previous document"),
             ("h", "this help"),
         ];
         let key_w = 14;
@@ -635,6 +827,45 @@ impl<'a> Pager<'a> {
             Print(format!("└{}┘", "─".repeat(inner_w + 2)))
         )?;
         Ok(())
+    }
+}
+
+/// GitHub-style heading slug: lowercase, spaces to hyphens, punctuation
+/// dropped.
+fn slugify(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+        } else if c == ' ' || c == '-' || c == '_' {
+            out.push(if c == '_' { '_' } else { '-' });
+        }
+    }
+    out
+}
+
+/// Hands a URL to the OS opener, detached so the pager keeps its screen.
+fn open_external(url: &str, message: &mut Option<String>) {
+    let opener = if cfg!(target_os = "macos") {
+        "open".to_string()
+    } else {
+        std::env::var("BROWSER").unwrap_or_else(|_| "xdg-open".to_string())
+    };
+    match std::process::Command::new(&opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // Reap in the background so no zombie outlives the click.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            *message = Some(format!("Opened {url}"));
+        }
+        Err(err) => *message = Some(format!("{opener}: {err}")),
     }
 }
 
@@ -762,7 +993,8 @@ fn emit_span(
     if buf.is_empty() {
         return Ok((0, complete));
     }
-    if let Some(url) = &style.link {
+    let osc8 = style.link.as_deref().filter(|u| !u.starts_with('#'));
+    if let Some(url) = osc8 {
         queue!(out, Print(format!("\x1b]8;;{url}\x1b\\")))?;
     }
     if let Some(fg) = style.fg {
@@ -787,7 +1019,7 @@ fn emit_span(
         queue!(out, SetAttribute(Attribute::Reverse))?;
     }
     queue!(out, Print(&buf), SetAttribute(Attribute::Reset))?;
-    if style.link.is_some() {
+    if osc8.is_some() {
         queue!(out, Print("\x1b]8;;\x1b\\"))?;
     }
     Ok((used, complete))

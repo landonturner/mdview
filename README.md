@@ -70,6 +70,8 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `]` / `[`      | next / previous heading             |
 | `t`            | table of contents overlay           |
 | `v`            | toggle diagrams rendered / as source |
+| `o`            | follow a link (hint labels appear)  |
+| `Backspace` / `ctrl-o` | back to the previous document |
 | `h`            | help                                |
 | `q`            | quit                                |
 
