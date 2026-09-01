@@ -108,6 +108,12 @@ struct Renderer<'a> {
     at_item_start: bool,
 }
 
+/// Strips carriage returns and expands tabs; a raw `\t` reaching the terminal
+/// advances to the next tab stop and desyncs all column accounting.
+fn clean_inline(text: &str) -> String {
+    text.replace('\r', "").replace('\t', "    ")
+}
+
 fn heading_level(level: HeadingLevel) -> u8 {
     match level {
         HeadingLevel::H1 => 1,
@@ -155,8 +161,9 @@ impl<'a> Renderer<'a> {
     fn ensure_blank(&mut self) {
         let Some(last) = self.lines.last() else { return };
         let plain = last.plain();
-        if plain.trim().chars().all(|c| c == QUOTE_BAR) {
-            return; // already blank (possibly just a quote bar)
+        // Already blank: empty, or only (possibly nested) quote bars.
+        if plain.chars().all(|c| c.is_whitespace() || c == QUOTE_BAR) {
+            return;
         }
         let mut line = Line::default();
         for p in &self.prefixes {
@@ -216,13 +223,13 @@ impl<'a> Renderer<'a> {
             Event::Start(tag) => self.start_tag(tag),
             Event::End(tag) => self.end_tag(tag),
             Event::Text(t) => {
-                let text = t.replace('\r', "");
+                let text = clean_inline(&t);
                 self.inline.push(Span::new(text, self.cur_style()));
             }
             Event::Code(t) => {
                 let mut style = self.cur_style();
                 style.fg = Some(Color::Yellow);
-                self.inline.push(Span::new(t.into_string(), style));
+                self.inline.push(Span::new(clean_inline(&t), style));
             }
             Event::SoftBreak => self.inline.push(Span::new(" ", self.cur_style())),
             Event::HardBreak => self.inline.push(Span::new("\n", self.cur_style())),
@@ -245,11 +252,11 @@ impl<'a> Renderer<'a> {
             }
             Event::Html(t) | Event::InlineHtml(t) => {
                 let style = self.cur_style().dim();
-                self.inline.push(Span::new(t.replace('\r', ""), style));
+                self.inline.push(Span::new(clean_inline(&t), style));
             }
             Event::InlineMath(t) | Event::DisplayMath(t) => {
                 let style = self.cur_style().fg(Color::Yellow);
-                self.inline.push(Span::new(t.into_string(), style));
+                self.inline.push(Span::new(clean_inline(&t), style));
             }
         }
     }
@@ -771,6 +778,27 @@ mod tests {
         assert_eq!(doc.headings.len(), 2);
         assert_eq!(doc.headings[0].text, "One");
         assert_eq!(doc.headings[1].level, 2);
+    }
+
+    #[test]
+    fn expands_tabs_in_inline_text() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        let doc = render("a\tb and `c\td`\n", 80, &hl);
+        for line in &doc.lines {
+            assert!(!line.plain().contains('\t'), "raw tab in {:?}", line.plain());
+        }
+    }
+
+    #[test]
+    fn no_double_blank_between_nested_quote_paragraphs() {
+        let hl = Highlighter::new("base16-ocean.dark");
+        let doc = render("> > one\n> >\n> > two\n", 80, &hl);
+        let blanks = doc
+            .lines
+            .iter()
+            .filter(|l| l.plain().chars().all(|c| c.is_whitespace() || c == QUOTE_BAR))
+            .count();
+        assert_eq!(blanks, 1, "{:?}", doc.lines.iter().map(|l| l.plain()).collect::<Vec<_>>());
     }
 
     #[test]

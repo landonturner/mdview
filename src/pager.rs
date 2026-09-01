@@ -18,8 +18,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub fn run(source: &str, title: &str, cfg: &Config, hl: &Highlighter) -> Result<()> {
     let mut out = io::stdout();
     enable_raw_mode()?;
-    execute!(out, EnterAlternateScreen, cursor::Hide)?;
-    let result = Pager::new(source, title, cfg, hl).main_loop(&mut out);
+    // From here on, always restore the terminal — even if entering the
+    // alternate screen fails, raw mode must not leak to the shell.
+    let result = execute!(out, EnterAlternateScreen, cursor::Hide)
+        .map_err(Into::into)
+        .and_then(|_| Pager::new(source, title, cfg, hl).main_loop(&mut out));
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
     let _ = disable_raw_mode();
     result
@@ -343,31 +346,35 @@ impl<'a> Pager<'a> {
 
     fn draw_line(&self, out: &mut io::Stdout, idx: usize) -> Result<()> {
         let line = &self.doc.lines[idx];
-        let ranges: Vec<(usize, usize)> = self
-            .search
-            .iter()
-            .flat_map(|s| s.matches.iter())
-            .filter(|m| m.0 == idx)
-            .map(|m| (m.1, m.2))
-            .collect();
+        // Matches are sorted by line, so binary-search the slice for this row
+        // instead of scanning every match per visible line per frame.
+        let ranges: Vec<(usize, usize)> = match &self.search {
+            Some(s) => {
+                let start = s.matches.partition_point(|m| m.0 < idx);
+                let end = s.matches.partition_point(|m| m.0 <= idx);
+                s.matches[start..end].iter().map(|m| (m.1, m.2)).collect()
+            }
+            None => Vec::new(),
+        };
 
         let max = self.w as usize;
         let mut col = 0usize;
         let mut offset = 0usize; // byte offset into the line's plain text
-        for span in &line.spans {
-            if col >= max {
-                break;
-            }
+        'spans: for span in &line.spans {
             let len = span.text.len();
             for (seg, highlighted) in segment(&span.text, offset, &ranges) {
-                if col >= max {
-                    break;
-                }
                 let mut style = span.style.clone();
                 if highlighted {
                     style.reverse = true;
                 }
-                col += emit_span(out, seg, &style, max - col)?;
+                let (used, complete) = emit_span(out, seg, &style, max - col)?;
+                col += used;
+                // Stop at the first truncation: emitting later segments after
+                // skipping content here would garble the right edge (e.g. a
+                // wide CJK char that didn't fit followed by narrow chars).
+                if !complete {
+                    break 'spans;
+                }
             }
             offset += len;
         }
@@ -419,12 +426,15 @@ impl<'a> Pager<'a> {
     fn draw_toc(&self, out: &mut io::Stdout) -> Result<()> {
         let Mode::Toc { sel, .. } = self.mode else { return Ok(()) };
         let headings = &self.doc.headings;
+        // min-then-cap: on very narrow terminals the cap wins (a plain
+        // `clamp(16, w-6)` would panic when w < 22).
         let inner_w = headings
             .iter()
             .map(|h| h.text.as_str().width() + (h.level as usize - 1) * 2)
             .max()
             .unwrap_or(10)
-            .clamp(16, (self.w as usize).saturating_sub(6));
+            .max(16)
+            .min((self.w as usize).saturating_sub(6).max(4));
         let inner_h = headings.len().min(self.content_h().saturating_sub(2)).max(1);
         let scroll = sel.saturating_sub(inner_h.saturating_sub(1));
 
@@ -570,19 +580,28 @@ fn segment<'t>(
     out
 }
 
-fn emit_span(out: &mut io::Stdout, text: &str, style: &Style, budget: usize) -> Result<usize> {
+/// Writes `text` in `style`, using at most `budget` columns. Returns the
+/// columns used and whether the whole text fit.
+fn emit_span(
+    out: &mut io::Stdout,
+    text: &str,
+    style: &Style,
+    budget: usize,
+) -> Result<(usize, bool)> {
     let mut used = 0;
     let mut buf = String::new();
+    let mut complete = true;
     for ch in text.chars() {
         let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
         if used + cw > budget {
+            complete = false;
             break;
         }
         buf.push(ch);
         used += cw;
     }
     if buf.is_empty() {
-        return Ok(0);
+        return Ok((0, complete));
     }
     if let Some(url) = &style.link {
         queue!(out, Print(format!("\x1b]8;;{url}\x1b\\")))?;
@@ -612,7 +631,7 @@ fn emit_span(out: &mut io::Stdout, text: &str, style: &Style, budget: usize) -> 
     if style.link.is_some() {
         queue!(out, Print("\x1b]8;;\x1b\\"))?;
     }
-    Ok(used)
+    Ok((used, complete))
 }
 
 fn fold(ch: char) -> char {
