@@ -10,6 +10,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const QUOTE_BAR: char = '▎';
 const MAX_TABLE_CELL: usize = 40;
+/// Soft blue for links; explicit RGB so it reads as blue regardless of how
+/// the terminal theme tints ANSI bright-blue.
+const LINK_COLOR: Color = Color::Rgb { r: 0x5f, g: 0xaf, b: 0xff };
 
 pub struct Heading {
     pub line: usize,
@@ -352,14 +355,14 @@ impl<'a> Renderer<'a> {
             }
             Tag::Link { dest_url, .. } => {
                 let mut s = self.cur_style();
-                s.fg = Some(Color::Blue);
+                s.fg = Some(LINK_COLOR);
                 s.underline = true;
                 s.link = Some(dest_url.to_string());
                 self.styles.push(s);
             }
             Tag::Image { dest_url, .. } => {
                 let mut s = self.cur_style();
-                s.fg = Some(Color::Blue);
+                s.fg = Some(LINK_COLOR);
                 s.underline = true;
                 s.link = Some(dest_url.to_string());
                 self.styles.push(s.clone());
