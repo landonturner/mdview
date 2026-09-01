@@ -14,6 +14,8 @@ Ghostty, WezTerm, kitty, and friends).
 
 ![mdview rendering examples/demo.md](assets/demo.png)
 
+![tables, code, and footnotes rendered by mdview](assets/tables.png)
+
 ## Building
 
 The Rust toolchain is pinned via [mise](https://mise.jdx.dev) (`mise.toml`):
