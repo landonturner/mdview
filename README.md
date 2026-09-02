@@ -45,6 +45,13 @@ With [mise](https://mise.jdx.dev) (verifies SLSA build provenance):
 mise use -g github:landonturner/mdview@latest
 ```
 
+With [nix](https://nixos.org) (flakes):
+
+```sh
+nix run github:landonturner/mdview            # try it
+nix profile install github:landonturner/mdview
+```
+
 Or from source: `cargo install --git https://github.com/landonturner/mdview`
 
 ## Building
