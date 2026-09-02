@@ -109,10 +109,14 @@ wrap_width = 80
 # Blank columns at the left edge (shrinks to 0 on very narrow terminals).
 left_margin = 2
 
-# Any syntect default theme: base16-ocean.dark, base16-eighties.dark,
-# base16-mocha.dark, base16-ocean.light, InspiredGitHub, Solarized (dark),
-# Solarized (light)
-code_theme = "base16-ocean.dark"
+# "auto" detects the terminal background (OSC 11); or force "dark" / "light".
+# Drives the default code theme, link color, and mermaid/LaTeX colors.
+theme = "auto"
+
+# Code-block theme; unset matches the terminal theme. Any syntect default:
+#   base16-ocean.dark, base16-eighties.dark, base16-mocha.dark,
+#   base16-ocean.light, InspiredGitHub, Solarized (dark), Solarized (light)
+# code_theme = "base16-ocean.dark"
 
 # How mermaid/latex blocks start out: "rendered" diagrams, or their "text"
 # source (toggle with v).

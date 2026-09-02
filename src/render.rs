@@ -31,9 +31,23 @@ pub struct KittyImage {
     pub cols: u16,
     pub rows: u16,
 }
-/// Soft blue for links; explicit RGB so it reads as blue regardless of how
-/// the terminal theme tints ANSI bright-blue.
-const LINK_COLOR: Color = Color::Rgb { r: 0x5f, g: 0xaf, b: 0xff };
+/// The terminal's background disposition; drives every hard-coded color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TermTheme {
+    Dark,
+    Light,
+}
+
+impl TermTheme {
+    /// Explicit RGB link blue so it reads as a link regardless of how the
+    /// terminal palette tints ANSI bright-blue.
+    fn link_color(self) -> Color {
+        match self {
+            TermTheme::Dark => Color::Rgb { r: 0x5f, g: 0xaf, b: 0xff },
+            TermTheme::Light => Color::Rgb { r: 0x09, g: 0x69, b: 0xda },
+        }
+    }
+}
 
 pub struct Heading {
     pub line: usize,
@@ -80,10 +94,13 @@ pub struct RenderOpts<'a> {
     /// only a guess at the working directory — a wrong file:// link is worse
     /// than an inert one.
     pub resolve_links: bool,
+    /// Light/dark terminal background; picks link blue, H6 color, and
+    /// diagram colors.
+    pub theme: TermTheme,
 }
 
 pub fn render(source: &str, hl: &Highlighter, opts: &RenderOpts) -> Document {
-    let RenderOpts { width, base, image_mode, diagrams, resolve_links } = *opts;
+    let RenderOpts { width, base, image_mode, diagrams, resolve_links, theme } = *opts;
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -98,6 +115,7 @@ pub fn render(source: &str, hl: &Highlighter, opts: &RenderOpts) -> Document {
         image_mode,
         diagrams,
         resolve_links,
+        theme,
         images: Vec::new(),
         lines: Vec::new(),
         headings: Vec::new(),
@@ -155,6 +173,7 @@ struct Renderer<'a> {
     /// When false, mermaid/latex blocks stay syntax-highlighted code.
     diagrams: bool,
     resolve_links: bool,
+    theme: TermTheme,
     images: Vec<KittyImage>,
     lines: Vec<Line>,
     headings: Vec<Heading>,
@@ -257,14 +276,18 @@ fn heading_level(level: HeadingLevel) -> u8 {
     }
 }
 
-fn heading_style(level: u8) -> Style {
+fn heading_style(level: u8, theme: TermTheme) -> Style {
     let color = match level {
         1 => Color::Magenta,
         2 => Color::Cyan,
         3 => Color::Blue,
         4 => Color::Green,
         5 => Color::Yellow,
-        _ => Color::White,
+        // Bold white vanishes on a light background; flip with the theme.
+        _ => match theme {
+            TermTheme::Dark => Color::White,
+            TermTheme::Light => Color::Black,
+        },
     };
     Style::default().fg(color).bold()
 }
@@ -420,7 +443,7 @@ impl<'a> Renderer<'a> {
             Tag::Paragraph => self.block_start(),
             Tag::Heading { level, .. } => {
                 self.block_start();
-                self.styles.push(heading_style(heading_level(level)));
+                self.styles.push(heading_style(heading_level(level), self.theme));
             }
             Tag::BlockQuote(kind) => {
                 self.block_start();
@@ -533,7 +556,7 @@ impl<'a> Renderer<'a> {
             }
             Tag::Link { dest_url, .. } => {
                 let mut s = self.cur_style();
-                s.fg = Some(LINK_COLOR);
+                s.fg = Some(self.theme.link_color());
                 s.underline = true;
                 s.link = self.resolve_link(&dest_url);
                 self.styles.push(s);
@@ -572,7 +595,7 @@ impl<'a> Renderer<'a> {
                 if lv <= 2 {
                     let ch = if lv == 1 { "━" } else { "─" };
                     let w = text_width.clamp(1, self.avail());
-                    let mut style = heading_style(lv);
+                    let mut style = heading_style(lv, self.theme);
                     style.bold = false;
                     style.dim = lv == 2;
                     self.push_line(vec![Span::new(ch.repeat(w), style)]);
@@ -674,7 +697,7 @@ impl<'a> Renderer<'a> {
             }
             None => {
                 let mut s = self.cur_style();
-                s.fg = Some(LINK_COLOR);
+                s.fg = Some(self.theme.link_color());
                 s.underline = true;
                 s.link = Some(cap.url);
                 self.inline.push(Span::new(format!("🖼 {}", cap.alt), s));
@@ -773,9 +796,10 @@ impl<'a> Renderer<'a> {
         if !self.diagrams || !matches!(self.image_mode, ImageMode::Kitty { .. }) {
             return false;
         }
+        let dark = self.theme == TermTheme::Dark;
         let png = match code.lang.as_str() {
-            "mermaid" => crate::diagram::mermaid_png(&code.buf),
-            "latex" | "tex" | "math" | "katex" => crate::diagram::latex_png(&code.buf),
+            "mermaid" => crate::diagram::mermaid_png(&code.buf, dark),
+            "latex" | "tex" | "math" | "katex" => crate::diagram::latex_png(&code.buf, dark),
             _ => None,
         };
         let Some(png) = png else { return false };
@@ -1057,6 +1081,7 @@ mod tests {
             image_mode: ImageMode::None,
             diagrams: true,
             resolve_links: true,
+            theme: TermTheme::Dark,
         }
     }
 

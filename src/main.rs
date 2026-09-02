@@ -123,7 +123,30 @@ fn main() -> Result<()> {
     };
     let base = base.as_deref();
 
-    let hl = render::Highlighter::new(&cfg.code_theme);
+    // Resolve light/dark before building anything color-dependent. The probe
+    // needs a controlling tty; without one (cron, CI) fall back to dark. The
+    // plain non-TTY path strips colors anyway, so don't pay the probe there.
+    let interactive = std::io::stdout().is_terminal();
+    let theme = match cfg.theme.as_str() {
+        "dark" => render::TermTheme::Dark,
+        "light" => render::TermTheme::Light,
+        _ if interactive || args.dump => match kitty::probe().bg {
+            Some((r, g, b)) => {
+                let luma = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+                if luma > 128.0 { render::TermTheme::Light } else { render::TermTheme::Dark }
+            }
+            None => render::TermTheme::Dark,
+        },
+        _ => render::TermTheme::Dark,
+    };
+    let code_theme = cfg.code_theme.clone().unwrap_or_else(|| {
+        match theme {
+            render::TermTheme::Dark => "base16-ocean.dark",
+            render::TermTheme::Light => "InspiredGitHub",
+        }
+        .to_string()
+    });
+    let hl = render::Highlighter::new(&code_theme);
 
     if args.dump || !std::io::stdout().is_terminal() {
         let doc = render::render(
@@ -135,6 +158,7 @@ fn main() -> Result<()> {
                 image_mode: render::ImageMode::None,
                 diagrams: true,
                 resolve_links: args.file.is_some(),
+                theme,
             },
         );
         let mut out = std::io::BufWriter::new(std::io::stdout().lock());
@@ -157,7 +181,7 @@ fn main() -> Result<()> {
     // stdin's base is only a cwd guess, so relative links stay unresolved
     // there rather than pointing at the wrong files.
     let resolve_links = args.file.is_some();
-    pager::run(&source, &title, &cfg, &hl, base, resolve_links)
+    pager::run(&source, &title, &cfg, &hl, base, resolve_links, theme)
 }
 
 /// Handles `--config`: opens the config file in $EDITOR, seeding it with a
@@ -189,7 +213,10 @@ fn run_config() -> Result<()> {
     match config::check(&path) {
         Ok(cfg) => {
             println!("wrap_width = {}", cfg.wrap_width);
-            println!("code_theme = \"{}\"", cfg.code_theme);
+            match &cfg.code_theme {
+                Some(t) => println!("code_theme = \"{t}\""),
+                None => println!("code_theme unset (matches the terminal theme)"),
+            }
         }
         Err(err) => {
             eprintln!("warning: {}: {err}", path.display());

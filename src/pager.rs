@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::render::{render, Document, Highlighter, ImageMode, RenderOpts};
+use crate::render::{render, Document, Highlighter, ImageMode, RenderOpts, TermTheme};
 use crate::text::{Line, Style};
 use anyhow::Result;
 use crossterm::{
@@ -23,6 +23,7 @@ pub fn run(
     hl: &Highlighter,
     base: Option<&std::path::Path>,
     resolve_links: bool,
+    theme: TermTheme,
 ) -> Result<()> {
     let mut out = io::stdout();
     enable_raw_mode()?;
@@ -31,7 +32,7 @@ pub fn run(
     let result = execute!(out, EnterAlternateScreen, cursor::Hide)
         .map_err(Into::into)
         .and_then(|_| {
-            Pager::new(source, title, cfg, hl, base, resolve_links).main_loop(&mut out)
+            Pager::new(source, title, cfg, hl, base, resolve_links, theme).main_loop(&mut out)
         });
     let _ = crate::kitty::delete_all(&mut out);
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
@@ -91,6 +92,7 @@ struct Pager<'a> {
     hl: &'a Highlighter,
     base: Option<std::path::PathBuf>,
     resolve_links: bool,
+    theme: TermTheme,
     back_stack: Vec<HistoryEntry>,
     image_mode: ImageMode,
     /// Image ids already transmitted to the terminal this session.
@@ -119,6 +121,7 @@ impl<'a> Pager<'a> {
         hl: &'a Highlighter,
         base: Option<&std::path::Path>,
         resolve_links: bool,
+        theme: TermTheme,
     ) -> Self {
         let (w, h) = term_size();
         let image_mode = detect_image_mode();
@@ -132,6 +135,7 @@ impl<'a> Pager<'a> {
                 image_mode,
                 diagrams,
                 resolve_links,
+                theme,
             },
         );
         Self {
@@ -141,6 +145,7 @@ impl<'a> Pager<'a> {
             hl,
             base: base.map(|p| p.to_path_buf()),
             resolve_links,
+            theme,
             back_stack: Vec::new(),
             image_mode,
             transmitted: std::collections::HashSet::new(),
@@ -169,6 +174,7 @@ impl<'a> Pager<'a> {
             image_mode: self.image_mode,
             diagrams: self.diagrams,
             resolve_links: self.resolve_links,
+            theme: self.theme,
         }
     }
 
@@ -879,11 +885,6 @@ fn term_size() -> (u16, u16) {
 /// kitty, Ghostty, Konsole, … — answers the query; env vars are only the
 /// fallback when the probe times out). WezTerm answers the query but does not
 /// implement Unicode placeholders, so it is explicitly excluded.
-fn graphics_probe() -> &'static crate::kitty::Probe {
-    static PROBE: std::sync::OnceLock<crate::kitty::Probe> = std::sync::OnceLock::new();
-    PROBE.get_or_init(|| crate::kitty::probe_terminal(std::time::Duration::from_millis(500)))
-}
-
 /// Kitty graphics need protocol support plus the terminal's cell pixel size
 /// (window-size ioctl, or the probe's CSI 16t reply) to scale image grids.
 fn detect_image_mode() -> ImageMode {
@@ -892,7 +893,7 @@ fn detect_image_mode() -> ImageMode {
     if prog.eq_ignore_ascii_case("wezterm") || term.contains("wezterm") {
         return ImageMode::None;
     }
-    let probe = graphics_probe();
+    let probe = crate::kitty::probe();
     if !probe.graphics && !crate::kitty::env_hint() {
         return ImageMode::None;
     }

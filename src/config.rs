@@ -14,8 +14,12 @@ pub struct Config {
     /// output. Applied at print time; reflow width is computed so text still
     /// fits the terminal.
     pub left_margin: usize,
-    /// Syntect theme used for fenced code blocks.
-    pub code_theme: String,
+    /// "auto" (detect via OSC 11), "dark", or "light"; drives default code
+    /// theme, link blue, and diagram colors.
+    pub theme: String,
+    /// Syntect theme for fenced code blocks. Unset picks a default matching
+    /// the terminal theme.
+    pub code_theme: Option<String>,
     /// How mermaid/latex blocks start out: "rendered" as diagrams, or as
     /// their "text" source (toggled in the pager with v).
     pub default_view: String,
@@ -26,7 +30,8 @@ impl Default for Config {
         Self {
             wrap_width: 80,
             left_margin: 2,
-            code_theme: "base16-ocean.dark".to_string(),
+            theme: "auto".to_string(),
+            code_theme: None,
             default_view: "rendered".to_string(),
         }
     }
@@ -68,10 +73,13 @@ wrap_width = 80
 # Blank columns at the left edge (shrinks to 0 on very narrow terminals).
 left_margin = 2
 
-# Theme for fenced code blocks. One of:
+# "auto" detects the terminal background (OSC 11); or force "dark" / "light".
+theme = "auto"
+
+# Theme for fenced code blocks; unset matches the terminal theme. One of:
 #   base16-ocean.dark, base16-eighties.dark, base16-mocha.dark,
 #   base16-ocean.light, InspiredGitHub, Solarized (dark), Solarized (light)
-code_theme = "base16-ocean.dark"
+# code_theme = "base16-ocean.dark"
 
 # How mermaid/latex blocks start out: "rendered" diagrams, or their "text"
 # source (toggle with v).
@@ -93,14 +101,15 @@ pub fn check(path: &std::path::Path) -> Result<Config> {
     if !["rendered", "text"].contains(&cfg.default_view.as_str()) {
         bail!("default_view must be \"rendered\" or \"text\"");
     }
-    let themes = syntect::highlighting::ThemeSet::load_defaults().themes;
-    if !themes.contains_key(&cfg.code_theme) {
-        let known: Vec<&str> = themes.keys().map(String::as_str).collect();
-        bail!(
-            "unknown code_theme `{}`; available: {}",
-            cfg.code_theme,
-            known.join(", ")
-        );
+    if !["auto", "dark", "light"].contains(&cfg.theme.as_str()) {
+        bail!("theme must be \"auto\", \"dark\", or \"light\"");
+    }
+    if let Some(code_theme) = &cfg.code_theme {
+        let themes = syntect::highlighting::ThemeSet::load_defaults().themes;
+        if !themes.contains_key(code_theme) {
+            let known: Vec<&str> = themes.keys().map(String::as_str).collect();
+            bail!("unknown code_theme `{code_theme}`; available: {}", known.join(", "));
+        }
     }
     Ok(cfg)
 }

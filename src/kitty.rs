@@ -80,6 +80,15 @@ pub struct Probe {
     pub graphics: bool,
     /// Cell pixel size from a CSI 16t reply, if given.
     pub cell: Option<(u16, u16)>,
+    /// Terminal background color from an OSC 11 reply, if given.
+    pub bg: Option<(u8, u8, u8)>,
+}
+
+/// The probe, run once per process. Self-contained (it manages its own
+/// termios state), so it is safe to call before or after raw mode.
+pub fn probe() -> &'static Probe {
+    static PROBE: std::sync::OnceLock<Probe> = std::sync::OnceLock::new();
+    PROBE.get_or_init(|| probe_terminal(std::time::Duration::from_millis(500)))
 }
 
 /// Probes the terminal directly (requires raw mode): a graphics query and a
@@ -96,9 +105,23 @@ pub fn probe_terminal(timeout: std::time::Duration) -> Probe {
         if fd < 0 {
             return probe;
         }
-        // 1x1 RGB query image (id 31), then CSI 16t, then DA1.
-        let query = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c";
+        // Responses only arrive unbuffered in raw mode; manage it on this fd
+        // alone so the probe works before crossterm sets up the terminal.
+        let mut saved: libc::termios = std::mem::zeroed();
+        let restore = libc::tcgetattr(fd, &mut saved) == 0;
+        if restore {
+            let mut raw = saved;
+            libc::cfmakeraw(&mut raw);
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+        }
+        // 1x1 RGB query image (id 31), OSC 11 (background color), CSI 16t
+        // (cell size), then DA1 as the universal terminator.
+        let query =
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b]11;?\x1b\\\x1b[16t\x1b[c";
         if libc::write(fd, query.as_ptr().cast(), query.len()) < 0 {
+            if restore {
+                libc::tcsetattr(fd, libc::TCSANOW, &saved);
+            }
             libc::close(fd);
             return probe;
         }
@@ -136,6 +159,9 @@ pub fn probe_terminal(timeout: std::time::Duration) -> Probe {
         for b in non_response_bytes(&buf) {
             let _ = libc::ioctl(fd, libc::TIOCSTI, &b as *const u8);
         }
+        if restore {
+            libc::tcsetattr(fd, libc::TCSANOW, &saved);
+        }
         libc::close(fd);
         parse_probe(&buf, &mut probe);
     }
@@ -153,6 +179,17 @@ fn non_response_bytes(buf: &[u8]) -> Vec<u8> {
                 b'_' => {
                     // APC: runs until ESC \
                     let end = find(&buf[i + 2..], b"\x1b\\").map(|e| i + 2 + e + 2);
+                    i = end.unwrap_or(buf.len());
+                    continue;
+                }
+                b']' => {
+                    // OSC (our OSC 11 reply): runs until BEL or ESC \
+                    let tail = &buf[i + 2..];
+                    let end = tail
+                        .iter()
+                        .position(|&b| b == 0x07)
+                        .map(|e| i + 2 + e + 1)
+                        .or_else(|| find(tail, b"\x1b\\").map(|e| i + 2 + e + 2));
                     i = end.unwrap_or(buf.len());
                     continue;
                 }
@@ -199,6 +236,15 @@ fn parse_probe(buf: &[u8], probe: &mut Probe) {
         let end = find(tail, b"\x1b\\").unwrap_or(tail.len());
         probe.graphics = find(&tail[..end], b"OK").is_some();
     }
+    // Background reply: ESC ] 11 ; rgb:RRRR/GGGG/BBBB (BEL or ST terminated)
+    if let Some(i) = find(buf, b"\x1b]11;") {
+        let tail = &buf[i + 5..];
+        let end = tail
+            .iter()
+            .position(|&b| b == 0x07 || b == 0x1b)
+            .unwrap_or(tail.len());
+        probe.bg = parse_x_color(&String::from_utf8_lossy(&tail[..end]));
+    }
     // Cell size reply: ESC [ 6 ; <height> ; <width> t
     if let Some(i) = find(buf, b"\x1b[6;") {
         let tail = &buf[i + 4..];
@@ -215,6 +261,24 @@ fn parse_probe(buf: &[u8], probe: &mut Probe) {
             }
         }
     }
+}
+
+/// Parses X11 color spec replies: `rgb:2b2b/3030/3b3b` (1-4 hex digits per
+/// channel, scaled to 8 bits).
+fn parse_x_color(s: &str) -> Option<(u8, u8, u8)> {
+    let body = s.trim().strip_prefix("rgb:")?;
+    let mut out = [0u8; 3];
+    let mut parts = body.split('/');
+    for slot in &mut out {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 4 {
+            return None;
+        }
+        let v = u16::from_str_radix(p, 16).ok()? as u32;
+        let max = (1u32 << (4 * p.len() as u32)) - 1;
+        *slot = ((v * 255 + max / 2) / max) as u8;
+    }
+    Some((out[0], out[1], out[2]))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -259,4 +323,23 @@ pub fn placeholder_cell(row: usize, col: usize) -> Option<String> {
     s.push(*r);
     s.push(*c);
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_x_color_replies() {
+        assert_eq!(parse_x_color("rgb:2b2b/3030/3b3b"), Some((0x2b, 0x30, 0x3b)));
+        assert_eq!(parse_x_color("rgb:ff/ff/ff"), Some((255, 255, 255)));
+        assert_eq!(parse_x_color("rgb:f/0/8"), Some((255, 0, 0x88)));
+        assert_eq!(parse_x_color("nonsense"), None);
+    }
+
+    #[test]
+    fn probe_replies_are_never_reinjected() {
+        let buf = b"\x1b_Gi=31;OK\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[6;20;10t\x1b[?64cq";
+        assert_eq!(non_response_bytes(buf), b"q");
+    }
 }

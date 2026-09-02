@@ -16,8 +16,6 @@ use std::time::Duration;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_PNG_BYTES: u64 = 8 * 1024 * 1024;
-/// Matches the dark background diagrams are composited onto (base16 ocean).
-const MERMAID_BG: &str = "!2b303b";
 
 enum Slot {
     /// A background fetch is in flight.
@@ -42,27 +40,34 @@ pub fn take_dirty() -> bool {
 /// Non-blocking: returns the PNG when it is already available (memo or disk
 /// cache), otherwise kicks off a background fetch and returns None — the
 /// caller renders its fallback now and re-renders when [`take_dirty`] fires.
-pub fn mermaid_png(source: &str) -> Option<Vec<u8>> {
+pub fn mermaid_png(source: &str, dark: bool) -> Option<Vec<u8>> {
+    // Backgrounds chosen to sit naturally on typical terminal themes.
+    let (theme, bg, kind) = if dark {
+        ("dark", "!2b303b", "mermaid-dark")
+    } else {
+        ("default", "!ffffff", "mermaid-light")
+    };
     let state = serde_json::json!({
         "code": source,
-        "mermaid": { "theme": "dark" },
+        "mermaid": { "theme": theme },
     });
     let b64 = base64::engine::general_purpose::URL_SAFE.encode(state.to_string());
-    let url = format!("https://mermaid.ink/img/base64:{b64}?type=png&bgColor={MERMAID_BG}");
-    lookup("mermaid", source, url)
+    let url = format!("https://mermaid.ink/img/base64:{b64}?type=png&bgColor={bg}");
+    lookup(kind, source, url)
 }
 
 /// See [`mermaid_png`]; same non-blocking contract.
-pub fn latex_png(source: &str) -> Option<Vec<u8>> {
+pub fn latex_png(source: &str, dark: bool) -> Option<Vec<u8>> {
+    let (color, kind) = if dark { ("white", "latex-dark") } else { ("black", "latex-light") };
     let expr = format!(
-        "\\dpi{{200}}\\bg{{transparent}}\\color{{white}}{}",
+        "\\dpi{{200}}\\bg{{transparent}}\\color{{{color}}}{}",
         source.trim()
     );
     let url = format!(
         "https://latex.codecogs.com/png.image?{}",
         percent_encode(&expr)
     );
-    lookup("latex", source, url)
+    lookup(kind, source, url)
 }
 
 fn lookup(kind: &str, source: &str, url: String) -> Option<Vec<u8>> {
@@ -110,7 +115,6 @@ fn cache_key(kind: &str, source: &str) -> String {
     // Two independent hashes to make accidental collisions implausible.
     let a = h.finish();
     source.len().hash(&mut h);
-    MERMAID_BG.hash(&mut h);
     format!("{kind}-{a:016x}{:016x}", h.finish())
 }
 
