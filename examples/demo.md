@@ -25,6 +25,18 @@ forces a new line mid-paragraph, like the two lines above.
 GitHub emoji shortcodes render as real emoji: :book: :rocket: :tada:
 :sparkles: — but stay literal in code, like `:book:`.
 
+## Links you can follow
+
+Press `o` right now: labels appear on every visible link, and the next
+keypress follows one. Markdown files open in place — `Backspace` brings you
+back here, scroll position intact.
+
+- Start the tour: [the navigation guide](guide.md)
+- Jump into a subdirectory: [the key reference](reference/keys.md)
+- Land mid-file: [the searching section](reference/keys.md#searching)
+- Stay in this document: [the tables section](#tables)
+- Leave the terminal: [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark)
+
 ## Headings
 
 Level-one and level-two headings get colored underlines; deeper levels just
