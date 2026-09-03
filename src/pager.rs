@@ -915,9 +915,14 @@ fn effective_margin(cfg: &Config, term_w: u16) -> u16 {
     (cfg.left_margin as u16).min(term_w.saturating_sub(20))
 }
 
+/// Columns paragraphs reflow to: the configured `wrap_width` capped at what
+/// the terminal can show, or the full usable terminal width when `wrap_width`
+/// is 0 ("auto"). Re-evaluated on every resize, so tmux pane splits and
+/// window changes re-wrap the document.
 fn wrap_width(cfg: &Config, term_w: u16) -> usize {
-    let usable = term_w.saturating_sub(effective_margin(cfg, term_w));
-    cfg.wrap_width.min(usable as usize).max(20)
+    let usable = (term_w.saturating_sub(effective_margin(cfg, term_w))) as usize;
+    let cap = if cfg.wrap_width == 0 { usize::MAX } else { cfg.wrap_width };
+    cap.min(usable).max(20)
 }
 
 /// Truncates a string to at most `max` display columns.
@@ -1080,6 +1085,19 @@ mod tests {
         let mut l = Line::default();
         l.push(Span::plain(s));
         l
+    }
+
+    #[test]
+    fn wrap_width_caps_at_config_or_fills_terminal() {
+        let mut cfg = Config::default();
+        cfg.left_margin = 2;
+        cfg.wrap_width = 80;
+        assert_eq!(wrap_width(&cfg, 200), 80);
+        assert_eq!(wrap_width(&cfg, 60), 58);
+        cfg.wrap_width = 0;
+        assert_eq!(wrap_width(&cfg, 200), 198);
+        assert_eq!(wrap_width(&cfg, 60), 58);
+        assert_eq!(wrap_width(&cfg, 10), 20);
     }
 
     #[test]

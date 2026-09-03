@@ -93,7 +93,8 @@ Counts work like less: `10j`, `5k`, `42g`.
 ## Options
 
 ```
--w, --width <N>   reflow paragraphs to at most N columns (this run only)
+-w, --width <N>   reflow paragraphs to at most N columns (this run only);
+                  0 or `auto` wraps at the terminal width, re-wrapping on resize
 -d, --dump        print the rendered document (with ANSI styling) and exit
 -c, --config      open the config file in $EDITOR
     --clear-cache delete the rendered-diagram cache (mermaid/LaTeX)
@@ -110,7 +111,8 @@ seeding it with a commented template on first use and validating it when the
 editor closes:
 
 ```toml
-# Paragraphs reflow to at most this many columns (capped at the terminal width).
+# Paragraphs reflow to at most this many columns (capped at the terminal
+# width). 0 wraps at the full terminal width and re-wraps on resize.
 wrap_width = 80
 
 # Blank columns at the left edge (shrinks to 0 on very narrow terminals).

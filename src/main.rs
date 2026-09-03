@@ -18,7 +18,8 @@ Usage: mdview [OPTIONS] [FILE]
 
 Options:
   -w, --width <N>       Reflow paragraphs to at most N columns (default 80,
-                        or `wrap_width` in the config file)
+                        or `wrap_width` in the config file); 0 or `auto`
+                        wraps at the terminal width and re-wraps on resize
   -d, --dump            Print the rendered document to stdout and exit
   -c, --config          Open the config file in $EDITOR (creating it with
                         defaults first if needed)
@@ -32,6 +33,14 @@ Config file: ~/.config/mdview/config.toml
   default_view = \"rendered\"   # or \"text\": show diagram blocks as source
 
 Press h inside the pager for key bindings.";
+
+/// `--width` value: a column count, or 0 / `auto` for the terminal width.
+fn parse_width(v: &str) -> Result<usize> {
+    if v.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    v.parse().context("--width must be a number or `auto`")
+}
 
 struct Args {
     file: Option<String>,
@@ -60,10 +69,10 @@ fn parse_args() -> Result<Args> {
             "--clear-cache" => args.clear_cache = true,
             "-w" | "--width" => {
                 let v = it.next().context("--width requires a value")?;
-                args.width = Some(v.parse().context("--width must be a number")?);
+                args.width = Some(parse_width(&v)?);
             }
             _ if arg.starts_with("--width=") => {
-                args.width = Some(arg["--width=".len()..].parse().context("--width must be a number")?);
+                args.width = Some(parse_width(&arg["--width=".len()..])?);
             }
             _ if arg.starts_with('-') && arg != "-" => bail!("unknown option: {arg}\n\n{USAGE}"),
             _ => {
@@ -94,7 +103,7 @@ fn main() -> Result<()> {
     }
 
     if let Some(w) = args.width {
-        cfg.wrap_width = w.max(20);
+        cfg.wrap_width = if w == 0 { 0 } else { w.max(20) };
     }
 
     let (source, title, base) = match &args.file {
@@ -153,7 +162,7 @@ fn main() -> Result<()> {
             &source,
             &hl,
             &render::RenderOpts {
-                width: cfg.wrap_width,
+                width: dump_width(&cfg),
                 base,
                 image_mode: render::ImageMode::None,
                 diagrams: true,
@@ -186,6 +195,17 @@ fn main() -> Result<()> {
 
 /// Handles `--config`: opens the config file in $EDITOR, seeding it with a
 /// commented template first if it doesn't exist yet.
+/// Reflow width for `--dump` / piped output: the configured width, or for
+/// `wrap_width = 0` the width of the controlling terminal (80 when there is
+/// none, e.g. inside a pipeline) less the left margin.
+fn dump_width(cfg: &config::Config) -> usize {
+    if cfg.wrap_width != 0 {
+        return cfg.wrap_width;
+    }
+    let term_w = crossterm::terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    term_w.saturating_sub(cfg.left_margin.min(16)).max(20)
+}
+
 fn run_config() -> Result<()> {
     let path = config::config_path().context("cannot determine the config directory")?;
     if !path.exists() {

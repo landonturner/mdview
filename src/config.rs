@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Maximum column paragraphs are reflowed to. The effective width is the
-    /// smaller of this and the terminal width.
+    /// smaller of this and the terminal width; 0 means "fill the terminal".
     pub wrap_width: usize,
     /// Columns of blank margin at the left edge of the pager and --dump
     /// output. Applied at print time; reflow width is computed so text still
@@ -67,7 +67,8 @@ pub fn load() -> Config {
 /// Written when `--config` is used before any config file exists.
 pub const TEMPLATE: &str = r#"# mdview configuration
 
-# Paragraphs reflow to at most this many columns (capped at the terminal width).
+# Paragraphs reflow to at most this many columns (capped at the terminal
+# width). 0 wraps at the full terminal width and re-wraps on resize.
 wrap_width = 80
 
 # Blank columns at the left edge (shrinks to 0 on very narrow terminals).
@@ -92,8 +93,8 @@ pub fn check(path: &std::path::Path) -> Result<Config> {
     let contents =
         std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let cfg: Config = toml::from_str(&contents)?;
-    if cfg.wrap_width < 20 {
-        bail!("wrap_width must be at least 20");
+    if cfg.wrap_width != 0 && cfg.wrap_width < 20 {
+        bail!("wrap_width must be 0 (fill the terminal) or at least 20");
     }
     if cfg.left_margin > 16 {
         bail!("left_margin must be at most 16");
