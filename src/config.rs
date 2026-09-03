@@ -28,7 +28,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            wrap_width: 80,
+            wrap_width: 120,
             left_margin: 2,
             theme: "auto".to_string(),
             code_theme: None,
@@ -69,7 +69,7 @@ pub const TEMPLATE: &str = r#"# mdview configuration
 
 # Paragraphs reflow to at most this many columns (capped at the terminal
 # width). 0 wraps at the full terminal width and re-wraps on resize.
-wrap_width = 80
+wrap_width = 120
 
 # Blank columns at the left edge (shrinks to 0 on very narrow terminals).
 left_margin = 2

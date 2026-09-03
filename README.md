@@ -113,7 +113,7 @@ editor closes:
 ```toml
 # Paragraphs reflow to at most this many columns (capped at the terminal
 # width). 0 wraps at the full terminal width and re-wraps on resize.
-wrap_width = 80
+wrap_width = 120
 
 # Blank columns at the left edge (shrinks to 0 on very narrow terminals).
 left_margin = 2

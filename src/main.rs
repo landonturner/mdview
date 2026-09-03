@@ -17,7 +17,7 @@ Usage: mdview [OPTIONS] [FILE]
        command | mdview
 
 Options:
-  -w, --width <N>       Reflow paragraphs to at most N columns (default 80,
+  -w, --width <N>       Reflow paragraphs to at most N columns (default 120,
                         or `wrap_width` in the config file); 0 or `auto`
                         wraps at the terminal width and re-wraps on resize
   -d, --dump            Print the rendered document to stdout and exit
@@ -28,7 +28,7 @@ Options:
   -V, --version         Show version
 
 Config file: ~/.config/mdview/config.toml
-  wrap_width = 80
+  wrap_width = 120
   code_theme = \"base16-ocean.dark\"
   default_view = \"rendered\"   # or \"text\": show diagram blocks as source
 
