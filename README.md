@@ -37,6 +37,19 @@ resize, which makes a tmux pane behave like a live preview.
 |---|---|
 | ![tables with alignment and wrapped cells](assets/tables.png) | ![mdview rendering an image of itself](assets/inline-images.png) |
 
+## Live reload
+
+Open a document once and leave it open. Every time the file is saved, by
+you in an editor or by an agent writing it, mdview re-reads it and re-renders
+in place, keeping your scroll position and search. A markdown file being
+written by a coding agent becomes a live preview: no quitting, no reopening,
+no losing your place.
+
+![mdview re-rendering a plan as an agent writes it](assets/hot-reload.gif)
+
+It's on by default; set `hot_reload = false` in the config file to freeze the
+view at open time.
+
 ## Installing
 
 Shell installer (macOS or Linux, no toolchain needed):
