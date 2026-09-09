@@ -31,6 +31,7 @@ Config file: ~/.config/mdview/config.toml
   wrap_width = 120
   code_theme = \"base16-ocean.dark\"
   default_view = \"rendered\"   # or \"text\": show diagram blocks as source
+  hot_reload = true           # re-render when the file changes on disk
 
 Press h inside the pager for key bindings.";
 
@@ -106,6 +107,7 @@ fn main() -> Result<()> {
         cfg.wrap_width = if w == 0 { 0 } else { w.max(20) };
     }
 
+    let file_path = args.file.as_deref().filter(|p| *p != "-").map(std::path::PathBuf::from);
     let (source, title, base) = match &args.file {
         Some(path) if path != "-" => {
             let contents = std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
@@ -193,7 +195,7 @@ fn main() -> Result<()> {
     // stdin's base is only a cwd guess, so relative links stay unresolved
     // there rather than pointing at the wrong files.
     let resolve_links = args.file.is_some();
-    pager::run(&source, &title, &cfg, &hl, base, resolve_links, theme)
+    pager::run(&source, &title, file_path.as_deref(), &cfg, &hl, base, resolve_links, theme)
 }
 
 /// Handles `--config`: opens the config file in $EDITOR, seeding it with a

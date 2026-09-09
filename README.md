@@ -133,3 +133,8 @@ default_view = "rendered"
 ```
 
 All keys are optional; `--width` overrides the file.
+
+`hot_reload = true` (the default) makes mdview re-read the file whenever it
+changes on disk and re-render in place, keeping your scroll position, so a
+document being written by an editor or an agent stays current without
+reopening it. Set it to `false` to freeze the view at open time.

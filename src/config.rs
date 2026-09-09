@@ -23,6 +23,9 @@ pub struct Config {
     /// How mermaid/latex blocks start out: "rendered" as diagrams, or as
     /// their "text" source (toggled in the pager with v).
     pub default_view: String,
+    /// Re-read the file and re-render when it changes on disk, keeping the
+    /// scroll position.
+    pub hot_reload: bool,
 }
 
 impl Default for Config {
@@ -33,6 +36,7 @@ impl Default for Config {
             theme: "auto".to_string(),
             code_theme: None,
             default_view: "rendered".to_string(),
+            hot_reload: true,
         }
     }
 }
@@ -85,6 +89,10 @@ theme = "auto"
 # How mermaid/latex blocks start out: "rendered" diagrams, or their "text"
 # source (toggle with v).
 default_view = "rendered"
+
+# Re-read the file and re-render when it changes on disk (e.g. an editor or
+# an agent writes it), keeping the scroll position.
+hot_reload = true
 "#;
 
 /// Validates the config file, returning an error message if it won't load

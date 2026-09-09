@@ -19,6 +19,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub fn run(
     source: &str,
     title: &str,
+    path: Option<&Path>,
     cfg: &Config,
     hl: &Highlighter,
     base: Option<&std::path::Path>,
@@ -32,7 +33,7 @@ pub fn run(
     let result = execute!(out, EnterAlternateScreen, cursor::Hide)
         .map_err(Into::into)
         .and_then(|_| {
-            Pager::new(source, title, cfg, hl, base, resolve_links, theme).main_loop(&mut out)
+            Pager::new(source, title, path, cfg, hl, base, resolve_links, theme).main_loop(&mut out)
         });
     let _ = crate::kitty::delete_all(&mut out);
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
@@ -74,8 +75,17 @@ struct LinkTarget {
 struct HistoryEntry {
     source: String,
     title: String,
+    path: Option<std::path::PathBuf>,
     base: Option<std::path::PathBuf>,
     top: usize,
+}
+
+/// Cheap change detector for hot reload: mtime plus size.
+type FileStamp = (std::time::SystemTime, u64);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
 }
 
 struct Search {
@@ -88,6 +98,11 @@ struct Search {
 struct Pager<'a> {
     source: String,
     title: String,
+    /// The file on disk backing `source` (None for stdin); watched for
+    /// hot reload.
+    path: Option<std::path::PathBuf>,
+    /// What `path` looked like when `source` was last read.
+    file_stamp: Option<FileStamp>,
     cfg: &'a Config,
     hl: &'a Highlighter,
     base: Option<std::path::PathBuf>,
@@ -117,6 +132,7 @@ impl<'a> Pager<'a> {
     fn new(
         source: &str,
         title: &str,
+        path: Option<&Path>,
         cfg: &'a Config,
         hl: &'a Highlighter,
         base: Option<&std::path::Path>,
@@ -141,6 +157,8 @@ impl<'a> Pager<'a> {
         Self {
             source: source.to_string(),
             title: title.to_string(),
+            path: path.map(Path::to_path_buf),
+            file_stamp: path.and_then(file_stamp),
             cfg,
             hl,
             base: base.map(|p| p.to_path_buf()),
@@ -254,6 +272,9 @@ impl<'a> Pager<'a> {
                 self.images_stale = true;
                 changed = true;
             }
+            if self.cfg.hot_reload && self.reload_if_changed() {
+                changed = true;
+            }
             if self.images_stale {
                 self.sync_images(out)?;
                 self.images_stale = false;
@@ -265,6 +286,35 @@ impl<'a> Pager<'a> {
                 self.draw(out)?;
             }
         }
+    }
+
+    /// Re-reads the backing file if it changed on disk since the last read
+    /// and re-renders in place, keeping the scroll position and search.
+    /// Returns true when the view was replaced.
+    fn reload_if_changed(&mut self) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return false;
+        };
+        let stamp = file_stamp(path);
+        if stamp.is_none() || stamp == self.file_stamp {
+            // Missing (mid atomic replace) or unchanged: try again next tick.
+            return false;
+        }
+        // Read errors are transient during writes; leave the stamp alone so
+        // the next tick retries.
+        let Ok(source) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        self.file_stamp = stamp;
+        if source == self.source {
+            return false;
+        }
+        self.source = source;
+        self.doc = render(&self.source, self.hl, &self.render_opts());
+        self.top = self.top.min(self.max_top());
+        self.research();
+        self.images_stale = true;
+        true
     }
 
     fn resize(&mut self, w: u16, h: u16) {
@@ -507,9 +557,11 @@ impl<'a> Pager<'a> {
         self.back_stack.push(HistoryEntry {
             source: std::mem::take(&mut self.source),
             title: std::mem::replace(&mut self.title, title),
+            path: std::mem::replace(&mut self.path, Some(path.to_path_buf())),
             base: std::mem::replace(&mut self.base, base),
             top: self.top,
         });
+        self.file_stamp = file_stamp(path);
         self.source = source;
         self.resolve_links = true; // navigated docs always have a real base
         self.doc = render(&self.source, self.hl, &self.render_opts());
@@ -529,7 +581,9 @@ impl<'a> Pager<'a> {
         };
         self.source = prev.source;
         self.title = prev.title;
+        self.path = prev.path;
         self.base = prev.base;
+        self.file_stamp = self.path.as_deref().and_then(file_stamp);
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = prev.top.min(self.max_top());
         self.search = None;
