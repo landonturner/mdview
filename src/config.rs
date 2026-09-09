@@ -26,6 +26,9 @@ pub struct Config {
     /// Re-read the file and re-render when it changes on disk, keeping the
     /// scroll position.
     pub hot_reload: bool,
+    /// How table cells that don't fit start out: "wrap" onto extra lines, or
+    /// "compact" (one line per row, cut with …). Toggled in the pager with w.
+    pub table_view: String,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
             code_theme: None,
             default_view: "rendered".to_string(),
             hot_reload: true,
+            table_view: "wrap".to_string(),
         }
     }
 }
@@ -93,6 +97,10 @@ default_view = "rendered"
 # Re-read the file and re-render when it changes on disk (e.g. an editor or
 # an agent writes it), keeping the scroll position.
 hot_reload = true
+
+# Table cells that don't fit: "wrap" onto extra lines, or "compact" (one
+# line per row, cut with …). Toggle in the pager with w.
+table_view = "wrap"
 "#;
 
 /// Validates the config file, returning an error message if it won't load
@@ -109,6 +117,9 @@ pub fn check(path: &std::path::Path) -> Result<Config> {
     }
     if !["rendered", "text"].contains(&cfg.default_view.as_str()) {
         bail!("default_view must be \"rendered\" or \"text\"");
+    }
+    if !["wrap", "compact"].contains(&cfg.table_view.as_str()) {
+        bail!("table_view must be \"wrap\" or \"compact\"");
     }
     if !["auto", "dark", "light"].contains(&cfg.theme.as_str()) {
         bail!("theme must be \"auto\", \"dark\", or \"light\"");

@@ -32,6 +32,7 @@ Config file: ~/.config/mdview/config.toml
   code_theme = \"base16-ocean.dark\"
   default_view = \"rendered\"   # or \"text\": show diagram blocks as source
   hot_reload = true           # re-render when the file changes on disk
+  table_view = \"wrap\"        # or \"compact\": one line per row, cut with …
 
 Press h inside the pager for key bindings.";
 
@@ -171,6 +172,7 @@ fn main() -> Result<()> {
                 base,
                 image_mode: render::ImageMode::None,
                 diagrams: true,
+                wrap_tables: cfg.table_view == "wrap",
                 resolve_links: args.file.is_some(),
                 theme,
             },

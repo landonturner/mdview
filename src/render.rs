@@ -90,6 +90,9 @@ pub struct RenderOpts<'a> {
     pub image_mode: ImageMode,
     /// When false, mermaid/latex blocks stay syntax-highlighted code.
     pub diagrams: bool,
+    /// Wrap long table cells onto extra lines (rows grow as tall as their
+    /// tallest cell). When false, cells are cut to one line with `…`.
+    pub wrap_tables: bool,
     /// Resolve relative links against `base`. Off for stdin, where base is
     /// only a guess at the working directory — a wrong file:// link is worse
     /// than an inert one.
@@ -100,7 +103,7 @@ pub struct RenderOpts<'a> {
 }
 
 pub fn render(source: &str, hl: &Highlighter, opts: &RenderOpts) -> Document {
-    let RenderOpts { width, base, image_mode, diagrams, resolve_links, theme } = *opts;
+    let RenderOpts { width, base, image_mode, diagrams, wrap_tables, resolve_links, theme } = *opts;
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -114,6 +117,7 @@ pub fn render(source: &str, hl: &Highlighter, opts: &RenderOpts) -> Document {
         base,
         image_mode,
         diagrams,
+        wrap_tables,
         resolve_links,
         theme,
         images: Vec::new(),
@@ -172,6 +176,7 @@ struct Renderer<'a> {
     image_mode: ImageMode,
     /// When false, mermaid/latex blocks stay syntax-highlighted code.
     diagrams: bool,
+    wrap_tables: bool,
     resolve_links: bool,
     theme: TermTheme,
     images: Vec<KittyImage>,
@@ -851,15 +856,22 @@ impl<'a> Renderer<'a> {
             return;
         }
 
+        // Natural column widths. Compact mode caps cells so one long cell
+        // cannot starve the rest; wrap mode lets a column be as wide as the
+        // terminal allows and folds whatever still doesn't fit.
+        let avail = self.avail();
+        let cell_cap = if self.wrap_tables { avail } else { MAX_TABLE_CELL };
         let mut widths = vec![1usize; ncols];
         for row in std::iter::once(&t.head).chain(t.rows.iter()) {
             for (i, cell) in row.iter().enumerate() {
                 let w: usize = cell.iter().map(|s| s.width()).sum();
-                widths[i] = widths[i].max(w.min(MAX_TABLE_CELL));
+                widths[i] = widths[i].max(w.min(cell_cap));
             }
         }
-        // Shrink the widest columns until the table fits (or columns bottom out).
-        let avail = self.avail();
+        // Shrink the widest columns until the table fits (or columns bottom
+        // out). Wrapped cells need a few more columns to be readable, so the
+        // floor is higher when wrapping.
+        let floor = if self.wrap_tables { 8 } else { 5 };
         loop {
             let total: usize = widths.iter().sum::<usize>() + 3 * ncols + 1;
             if total <= avail {
@@ -869,7 +881,7 @@ impl<'a> Renderer<'a> {
                 .iter()
                 .enumerate()
                 .max_by_key(|(_, w)| **w)
-                .filter(|(_, w)| **w > 5)
+                .filter(|(_, w)| **w > floor)
                 .map(|(i, _)| i)
             else {
                 break;
@@ -888,17 +900,21 @@ impl<'a> Renderer<'a> {
 
         self.push_line(vec![Span::new(hborder("┌", "┬", "┐"), border.clone())]);
         if !t.head.is_empty() {
-            let row = self.table_row(&t.head, &t.aligns, &widths, true, &border);
-            self.push_line(row);
+            for line in self.table_row(&t.head, &t.aligns, &widths, true, &border) {
+                self.push_line(line);
+            }
             self.push_line(vec![Span::new(hborder("├", "┼", "┤"), border.clone())]);
         }
         for row in &t.rows {
-            let row = self.table_row(row, &t.aligns, &widths, false, &border);
-            self.push_line(row);
+            for line in self.table_row(row, &t.aligns, &widths, false, &border) {
+                self.push_line(line);
+            }
         }
         self.push_line(vec![Span::new(hborder("└", "┴", "┘"), border)]);
     }
 
+    /// Lays out one table row: a single line in compact mode, or as many
+    /// lines as the tallest wrapped cell needs.
     fn table_row(
         &self,
         cells: &[Vec<Span>],
@@ -906,30 +922,53 @@ impl<'a> Renderer<'a> {
         widths: &[usize],
         bold: bool,
         border: &Style,
-    ) -> Vec<Span> {
-        let mut out = Vec::new();
-        for (i, width) in widths.iter().enumerate() {
-            out.push(Span::new(if i == 0 { "│ " } else { " │ " }, border.clone()));
-            let empty = Vec::new();
-            let cell = cells.get(i).unwrap_or(&empty);
-            let (mut spans, used) = truncate_spans(cell, *width);
-            if bold {
-                for s in &mut spans {
-                    s.style.bold = true;
+    ) -> Vec<Vec<Span>> {
+        let empty = Vec::new();
+        // Per column, the lines of that cell (already cut to `width`).
+        let cols: Vec<Vec<Vec<Span>>> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, width)| {
+                let cell = cells.get(i).unwrap_or(&empty);
+                let mut lines = if self.wrap_tables {
+                    wrap_spans(cell, *width)
+                } else {
+                    vec![truncate_spans(cell, *width).0]
+                };
+                if lines.is_empty() {
+                    lines.push(Vec::new());
                 }
-            }
-            let pad = width.saturating_sub(used);
-            let (left, right) = match aligns.get(i) {
-                Some(Alignment::Right) => (pad, 0),
-                Some(Alignment::Center) => (pad / 2, pad - pad / 2),
-                _ => (0, pad),
-            };
-            out.push(Span::plain(" ".repeat(left)));
-            out.extend(spans);
-            out.push(Span::plain(" ".repeat(right)));
-        }
-        out.push(Span::new(" │", border.clone()));
-        out
+                if bold {
+                    for s in lines.iter_mut().flatten() {
+                        s.style.bold = true;
+                    }
+                }
+                lines
+            })
+            .collect();
+        let height = cols.iter().map(Vec::len).max().unwrap_or(1);
+
+        (0..height)
+            .map(|ln| {
+                let mut out = Vec::new();
+                for (i, width) in widths.iter().enumerate() {
+                    out.push(Span::new(if i == 0 { "│ " } else { " │ " }, border.clone()));
+                    let spans = cols[i].get(ln).cloned().unwrap_or_default();
+                    let used: usize = spans.iter().map(|s| s.width()).sum();
+                    let pad = width.saturating_sub(used);
+                    let (left, right) = match aligns.get(i) {
+                        Some(Alignment::Right) => (pad, 0),
+                        Some(Alignment::Center) => (pad / 2, pad - pad / 2),
+                        _ => (0, pad),
+                    };
+                    out.push(Span::plain(" ".repeat(left)));
+                    out.extend(spans);
+                    out.push(Span::plain(" ".repeat(right)));
+                }
+                out.push(Span::new(" │", border.clone()));
+                out
+            })
+            .collect()
     }
 }
 
@@ -1080,9 +1119,30 @@ mod tests {
             base: None,
             image_mode: ImageMode::None,
             diagrams: true,
+            wrap_tables: true,
             resolve_links: true,
             theme: TermTheme::Dark,
         }
+    }
+
+    #[test]
+    fn tables_wrap_long_cells_or_truncate_when_compact() {
+        let md = "| Name | Description |\n|---|---|\n| a | one two three four five six seven eight nine ten |\n";
+        let doc = render(md, &Highlighter::new("base16-ocean.dark"), &topts(40));
+        let wrapped: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
+        let body: Vec<&String> = wrapped.iter().filter(|l| l.contains("│")).collect();
+        assert!(body.len() > 2, "row should wrap onto extra lines: {wrapped:?}");
+        assert!(wrapped.iter().all(|l| !l.contains('…')), "no truncation when wrapping: {wrapped:?}");
+        assert!(wrapped.iter().any(|l| l.contains("ten")), "last word survives: {wrapped:?}");
+        assert!(wrapped.iter().all(|l| l.chars().count() <= 40), "fits the width: {wrapped:?}");
+
+        let mut compact = topts(40);
+        compact.wrap_tables = false;
+        let doc = render(md, &Highlighter::new("base16-ocean.dark"), &compact);
+        let lines: Vec<String> = doc.lines.iter().map(|l| l.plain()).collect();
+        let body: Vec<&String> = lines.iter().filter(|l| l.contains("│")).collect();
+        assert_eq!(body.len(), 2, "one line per row when compact: {lines:?}");
+        assert!(lines.iter().any(|l| l.contains('…')), "compact truncates: {lines:?}");
     }
 
     fn plain(lines: &[Vec<Span>]) -> Vec<String> {

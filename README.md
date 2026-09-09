@@ -77,6 +77,7 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `]` / `[`      | next / previous heading             |
 | `t`            | table of contents overlay           |
 | `v`            | toggle diagrams rendered / as source |
+| `w`            | toggle table cells wrapped / compact |
 | `o`            | follow a link (hint labels appear)  |
 | `Backspace` / `ctrl-o` | back to the previous document |
 | `h`            | help                                |
@@ -130,9 +131,19 @@ theme = "auto"
 # How mermaid/latex blocks start out: "rendered" diagrams, or their "text"
 # source (toggle with v).
 default_view = "rendered"
+
+# Re-render when the file changes on disk, keeping the scroll position.
+hot_reload = true
+
+# Long table cells: "wrap" onto extra lines, or "compact" (one line, cut with …).
+table_view = "wrap"
 ```
 
 All keys are optional; `--width` overrides the file.
+
+`table_view = "wrap"` (the default) folds long table cells onto extra lines so
+nothing is cut off; `"compact"` keeps one line per row and trims overflow with
+`…`. Either way, `w` in the pager switches between the two.
 
 `hot_reload = true` (the default) makes mdview re-read the file whenever it
 changes on disk and re-render in place, keeping your scroll position, so a

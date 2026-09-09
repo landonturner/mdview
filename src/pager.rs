@@ -115,6 +115,8 @@ struct Pager<'a> {
     doc: Document,
     /// When false, mermaid/latex blocks show their source instead.
     diagrams: bool,
+    /// Long table cells wrap onto extra lines (else one line per row, cut).
+    wrap_tables: bool,
     /// Set when a re-render may have introduced images the terminal has not
     /// been sent yet; main_loop syncs and clears it.
     images_stale: bool,
@@ -142,6 +144,7 @@ impl<'a> Pager<'a> {
         let (w, h) = term_size();
         let image_mode = detect_image_mode();
         let diagrams = cfg.default_view != "text";
+        let wrap_tables = cfg.table_view != "compact";
         let doc = render(
             source,
             hl,
@@ -150,6 +153,7 @@ impl<'a> Pager<'a> {
                 base,
                 image_mode,
                 diagrams,
+                wrap_tables,
                 resolve_links,
                 theme,
             },
@@ -169,6 +173,7 @@ impl<'a> Pager<'a> {
             transmitted: std::collections::HashSet::new(),
             doc,
             diagrams,
+            wrap_tables,
             images_stale: false,
             top: 0,
             w,
@@ -191,6 +196,7 @@ impl<'a> Pager<'a> {
             base: self.base.as_deref(),
             image_mode: self.image_mode,
             diagrams: self.diagrams,
+            wrap_tables: self.wrap_tables,
             resolve_links: self.resolve_links,
             theme: self.theme,
         }
@@ -211,6 +217,25 @@ impl<'a> Pager<'a> {
                 "diagrams: rendered".into()
             } else {
                 "diagrams: source".into()
+            },
+        );
+    }
+
+    /// Toggles table cells between wrapping onto extra lines and one cut
+    /// line per row, keeping the viewport position proportionally.
+    fn toggle_wrap_tables(&mut self) {
+        let old_len = self.lines().len().max(1);
+        let frac = self.top as f64 / old_len as f64;
+        self.wrap_tables = !self.wrap_tables;
+        self.doc = render(&self.source, self.hl, &self.render_opts());
+        self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
+        self.images_stale = true;
+        self.research();
+        self.message = Some(
+            if self.wrap_tables {
+                "tables: wrapped".into()
+            } else {
+                "tables: compact".into()
             },
         );
     }
@@ -394,6 +419,7 @@ impl<'a> Pager<'a> {
                 }
             }
             KeyCode::Char('v') => self.toggle_diagrams(),
+            KeyCode::Char('w') => self.toggle_wrap_tables(),
             KeyCode::Char('o') if ctrl => self.go_back(),
             KeyCode::Char('o') => self.enter_follow_mode(),
             KeyCode::Backspace => self.go_back(),
@@ -835,6 +861,7 @@ impl<'a> Pager<'a> {
             ("] / [", "next / previous heading"),
             ("t", "table of contents"),
             ("v", "show diagrams rendered / as source"),
+            ("w", "table cells wrapped / compact"),
             ("o", "follow a link (labels appear)"),
             ("BKSP / ^o", "back to previous document"),
             ("h", "this help"),
