@@ -84,18 +84,54 @@ pub struct Probe {
     pub bg: Option<(u8, u8, u8)>,
 }
 
+static QUERY_BACKGROUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the probe asks for the background color (OSC 11). Call before the
+/// first `probe()`; a forced `theme` has no use for the answer, and not
+/// asking means there is no reply to swallow.
+pub fn query_background(enabled: bool) {
+    QUERY_BACKGROUND.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The probe, run once per process. Self-contained (it manages its own
 /// termios state), so it is safe to call before or after raw mode.
 pub fn probe() -> &'static Probe {
     static PROBE: std::sync::OnceLock<Probe> = std::sync::OnceLock::new();
-    PROBE.get_or_init(|| probe_terminal(std::time::Duration::from_millis(500)))
+    PROBE.get_or_init(|| {
+        probe_terminal(
+            std::time::Duration::from_millis(500),
+            QUERY_BACKGROUND.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
+/// How long to keep listening for an OSC 11 reply after DA1 has answered.
+/// Multiplexers like tmux answer DA1 themselves but forward OSC 11 to the
+/// outer terminal, so the background reply can trail the "terminator".
+const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Blocks until `fd` is readable or `timeout` passes. `select`, not `poll`:
+/// macOS `poll(2)` does not support character devices and reports POLLNVAL
+/// for /dev/tty immediately, which would make the probe read nothing.
+fn wait_readable(fd: libc::c_int, timeout: std::time::Duration) -> bool {
+    unsafe {
+        let mut set: libc::fd_set = std::mem::zeroed();
+        libc::FD_ZERO(&mut set);
+        libc::FD_SET(fd, &mut set);
+        let mut tv = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        let ready = libc::select(fd + 1, &mut set, std::ptr::null_mut(), std::ptr::null_mut(), &mut tv);
+        ready > 0 && libc::FD_ISSET(fd, &set)
+    }
 }
 
 /// Probes the terminal directly (requires raw mode): a graphics query and a
 /// cell-size query, terminated by DA1 — every terminal answers DA1, so its
 /// reply tells us the others aren't coming. This detects any terminal that
 /// implements the protocol, not just ones we know by name.
-pub fn probe_terminal(timeout: std::time::Duration) -> Probe {
+pub fn probe_terminal(timeout: std::time::Duration, query_bg: bool) -> Probe {
     let mut probe = Probe::default();
     unsafe {
         let fd = libc::open(
@@ -114,10 +150,13 @@ pub fn probe_terminal(timeout: std::time::Duration) -> Probe {
             libc::cfmakeraw(&mut raw);
             libc::tcsetattr(fd, libc::TCSANOW, &raw);
         }
-        // 1x1 RGB query image (id 31), OSC 11 (background color), CSI 16t
-        // (cell size), then DA1 as the universal terminator.
-        let query =
-            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b]11;?\x1b\\\x1b[16t\x1b[c";
+        // 1x1 RGB query image (id 31), OSC 11 (background color, only when
+        // wanted), CSI 16t (cell size), then DA1 as the universal terminator.
+        let mut query: Vec<u8> = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\".to_vec();
+        if query_bg {
+            query.extend_from_slice(b"\x1b]11;?\x1b\\");
+        }
+        query.extend_from_slice(b"\x1b[16t\x1b[c");
         if libc::write(fd, query.as_ptr().cast(), query.len()) < 0 {
             if restore {
                 libc::tcsetattr(fd, libc::TCSANOW, &saved);
@@ -125,30 +164,37 @@ pub fn probe_terminal(timeout: std::time::Duration) -> Probe {
             libc::close(fd);
             return probe;
         }
-        let deadline = std::time::Instant::now() + timeout;
+        let mut deadline = std::time::Instant::now() + timeout;
         let mut buf: Vec<u8> = Vec::new();
+        let mut da1_seen = false;
         loop {
             let remain = deadline.saturating_duration_since(std::time::Instant::now());
-            if remain.is_zero() {
-                break;
-            }
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            let ready = libc::poll(&mut pfd, 1, remain.as_millis() as libc::c_int);
-            if ready <= 0 {
-                break;
-            }
-            // poll also wakes on POLLHUP/POLLERR with no data; reading then
-            // would block (or spin). Only read when input is actually there.
-            if pfd.revents & libc::POLLIN == 0 {
+            if remain.is_zero() || !wait_readable(fd, remain) {
                 break;
             }
             let mut chunk = [0u8; 256];
             let n = libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len());
-            if n <= 0 {
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::WouldBlock || err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            if n == 0 {
                 break;
             }
             buf.extend_from_slice(&chunk[..n as usize]);
+            let want_bg = query_bg && !background_answered(&buf);
             if da1_answered(&buf) {
+                if !want_bg {
+                    break;
+                }
+                if !da1_seen {
+                    da1_seen = true;
+                    deadline = deadline.min(std::time::Instant::now() + BACKGROUND_GRACE);
+                }
+            } else if da1_seen && !want_bg {
                 break;
             }
         }
@@ -219,6 +265,17 @@ fn non_response_bytes(buf: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// A complete OSC 11 reply (`ESC ] 11 ; ... BEL|ST`) has arrived.
+fn background_answered(buf: &[u8]) -> bool {
+    match find(buf, b"\x1b]11;") {
+        Some(i) => {
+            let tail = &buf[i + 5..];
+            tail.contains(&0x07) || find(tail, b"\x1b\\").is_some()
+        }
+        None => false,
+    }
 }
 
 /// The DA1 reply (`ESC [ ? ... c`) marks the end of the probe conversation.
@@ -335,6 +392,15 @@ mod tests {
         assert_eq!(parse_x_color("rgb:ff/ff/ff"), Some((255, 255, 255)));
         assert_eq!(parse_x_color("rgb:f/0/8"), Some((255, 0, 0x88)));
         assert_eq!(parse_x_color("nonsense"), None);
+    }
+
+    #[test]
+    fn background_reply_needs_its_terminator() {
+        assert!(!background_answered(b"\x1b]11;rgb:0000"));
+        assert!(!background_answered(b"\x1b]11;rgb:0000/0000/0000"));
+        assert!(background_answered(b"\x1b]11;rgb:0000/0000/0000\x07"));
+        assert!(background_answered(b"\x1b]11;rgb:0000/0000/0000\x1b\\"));
+        assert!(background_answered(b"\x1b[?64c\x1b]11;rgb:0000/0000/0000\x1b\\"));
     }
 
     #[test]

@@ -136,6 +136,9 @@ fn main() -> Result<()> {
     // needs a controlling tty; without one (cron, CI) fall back to dark. The
     // plain non-TTY path strips colors anyway, so don't pay the probe there.
     let interactive = std::io::stdout().is_terminal();
+    // A forced theme never looks at the OSC 11 answer, so don't ask: every
+    // reply we request is one we must swallow before it reaches the pager.
+    kitty::query_background(cfg.theme == "auto");
     let theme = match cfg.theme.as_str() {
         "dark" => render::TermTheme::Dark,
         "light" => render::TermTheme::Light,
