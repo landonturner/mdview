@@ -6,9 +6,14 @@ between sections with `]` and `[`, or press `t` to open the table of contents
 and hop straight to one. Press `h` any time for the full key list.
 
 This paragraph exists to demonstrate reflowing: no matter how the source file
-is wrapped, mdview reflows prose to a comfortable measure — 80 columns by
+is wrapped, mdview reflows prose to a comfortable measure — 120 columns by
 default, capped at your terminal width, and configurable with `--width` or
-`mdview --config`. Resize your terminal and watch it re-wrap live.
+`mdview --config` (`--width 0` fills the terminal). Resize your terminal and
+watch it re-wrap live.
+
+The file is watched, too: edit this document in another window, or let an
+agent write to it, and the view re-renders in place without losing your
+scroll position.
 
 ## Inline styles
 
@@ -166,12 +171,13 @@ Tables get box-drawing borders, bold headers, and per-column alignment
 | most     | 1991 |    no     |    obscure |
 | mdview   | 2026 |  **yes**  | you are here |
 
-Cells that are far too long to fit get truncated with an ellipsis rather than
-breaking the table:
+Cells that are too long to fit wrap onto extra lines rather than breaking the
+table or losing text. Press `w` to switch to compact rows, where long cells are
+cut with an ellipsis instead:
 
 | Key | Value |
 |-----|-------|
-| motto | This cell contains a truly unreasonable amount of text so that you can see the ellipsis truncation behavior in action |
+| motto | This cell contains a truly unreasonable amount of text so that you can see how long cells wrap onto extra lines, and how `w` collapses them back to one row |
 
 ## Horizontal rules
 

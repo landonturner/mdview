@@ -17,6 +17,12 @@ with Unicode placeholders (kitty and Ghostty among them — mdview probes the
 terminal at startup rather than checking names, so protocol-capable terminals
 work automatically); other terminals see a clickable link instead.
 
+Long table cells wrap onto extra lines instead of being cut off (`w` switches
+to compact one-line rows). The file is watched while you read: when an editor
+or an agent writes to it, the view re-renders in place and keeps your scroll
+position. `--width 0` wraps at the full terminal width and re-wraps as you
+resize, which makes a tmux pane behave like a live preview.
+
 ![mdview rendering examples/demo.md](assets/demo.png)
 
 | Admonitions | Diagrams & math (```` ```mermaid ````, ```` ```latex ````) |
@@ -29,7 +35,7 @@ work automatically); other terminals see a clickable link instead.
 
 | Tables | Inline images (kitty graphics — mdview showing its own README) |
 |---|---|
-| ![tables with alignment and cell truncation](assets/tables.png) | ![mdview rendering an image of itself](assets/inline-images.png) |
+| ![tables with alignment and wrapped cells](assets/tables.png) | ![mdview rendering an image of itself](assets/inline-images.png) |
 
 ## Installing
 
