@@ -15,7 +15,8 @@ iTerm2, Ghostty, WezTerm, kitty, and friends). Local images render inline at
 full resolution in any terminal that implements the kitty graphics protocol
 with Unicode placeholders (kitty and Ghostty among them — mdview probes the
 terminal at startup rather than checking names, so protocol-capable terminals
-work automatically); other terminals see a clickable link instead.
+work automatically); other terminals see a clickable link instead. This
+works inside tmux too, once passthrough is on (see [tmux](#tmux)).
 
 Long table cells wrap onto extra lines instead of being cut off (`w` switches
 to compact one-line rows). The file is watched while you read: when an editor
@@ -72,6 +73,21 @@ nix profile install github:landonturner/mdview
 ```
 
 Or from source: `cargo install --git https://github.com/landonturner/mdview`
+
+## tmux
+
+Inline images work inside tmux 3.3 or newer, but tmux blocks the graphics
+escape sequences unless you allow them through. Add this to `~/.tmux.conf`
+and restart tmux (or run it as a `tmux set -g` command):
+
+```
+set -g allow-passthrough on
+```
+
+mdview detects tmux and wraps its image transfers in tmux's passthrough
+envelope; the placeholder cells that position the image are ordinary text, so
+scrolling, splits, and detach/attach keep working. Without passthrough, images
+fall back to a clickable link.
 
 ## Building
 

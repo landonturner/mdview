@@ -73,6 +73,37 @@ pub fn env_hint() -> bool {
     term.contains("kitty") || term.contains("ghostty") || prog.eq_ignore_ascii_case("ghostty")
 }
 
+/// Running under tmux: graphics sequences must be wrapped in its DCS
+/// passthrough envelope (and the user must have `allow-passthrough on`) to
+/// reach the outer terminal. tmux also answers DA1 itself, so replies the
+/// outer terminal sends can trail the "terminator".
+pub fn in_tmux() -> bool {
+    std::env::var_os("TMUX").is_some()
+}
+
+/// Wraps `seq` for tmux (`ESC P tmux ; <seq with ESC doubled> ESC \`), or
+/// returns it unchanged outside tmux.
+fn passthrough(seq: &[u8]) -> Vec<u8> {
+    wrap_for_tmux(seq, in_tmux())
+}
+
+/// The tmux passthrough envelope, applied when `enabled`.
+pub fn wrap_for_tmux(seq: &[u8], enabled: bool) -> Vec<u8> {
+    if !enabled {
+        return seq.to_vec();
+    }
+    let mut out = Vec::with_capacity(seq.len() + 16);
+    out.extend_from_slice(b"\x1bPtmux;");
+    for &b in seq {
+        if b == 0x1b {
+            out.push(0x1b);
+        }
+        out.push(b);
+    }
+    out.extend_from_slice(b"\x1b\\");
+    out
+}
+
 /// What the terminal told us when probed.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Probe {
@@ -105,10 +136,11 @@ pub fn probe() -> &'static Probe {
     })
 }
 
-/// How long to keep listening for an OSC 11 reply after DA1 has answered.
-/// Multiplexers like tmux answer DA1 themselves but forward OSC 11 to the
-/// outer terminal, so the background reply can trail the "terminator".
-const BACKGROUND_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+/// How long to keep listening after DA1 has answered for replies that come
+/// from the outer terminal rather than the multiplexer: tmux answers DA1
+/// itself but forwards OSC 11 (and, with passthrough, the graphics query),
+/// so those replies can trail the "terminator".
+const TRAILING_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Blocks until `fd` is readable or `timeout` passes. `select`, not `poll`:
 /// macOS `poll(2)` does not support character devices and reports POLLNVAL
@@ -152,11 +184,14 @@ pub fn probe_terminal(timeout: std::time::Duration, query_bg: bool) -> Probe {
         }
         // 1x1 RGB query image (id 31), OSC 11 (background color, only when
         // wanted), CSI 16t (cell size), then DA1 as the universal terminator.
-        let mut query: Vec<u8> = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\".to_vec();
+        // Under tmux the graphics and cell-size queries are passed through
+        // to the outer terminal; tmux handles OSC 11 and DA1 itself.
+        let mut query = passthrough(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
         if query_bg {
             query.extend_from_slice(b"\x1b]11;?\x1b\\");
         }
-        query.extend_from_slice(b"\x1b[16t\x1b[c");
+        query.extend(passthrough(b"\x1b[16t"));
+        query.extend_from_slice(b"\x1b[c");
         if libc::write(fd, query.as_ptr().cast(), query.len()) < 0 {
             if restore {
                 libc::tcsetattr(fd, libc::TCSANOW, &saved);
@@ -185,16 +220,18 @@ pub fn probe_terminal(timeout: std::time::Duration, query_bg: bool) -> Probe {
                 break;
             }
             buf.extend_from_slice(&chunk[..n as usize]);
-            let want_bg = query_bg && !background_answered(&buf);
+            // Replies that may legitimately arrive after DA1.
+            let trailing = (query_bg && !background_answered(&buf))
+                || (in_tmux() && !graphics_answered(&buf));
             if da1_answered(&buf) {
-                if !want_bg {
+                if !trailing {
                     break;
                 }
                 if !da1_seen {
                     da1_seen = true;
-                    deadline = deadline.min(std::time::Instant::now() + BACKGROUND_GRACE);
+                    deadline = deadline.min(std::time::Instant::now() + TRAILING_GRACE);
                 }
-            } else if da1_seen && !want_bg {
+            } else if da1_seen && !trailing {
                 break;
             }
         }
@@ -265,6 +302,14 @@ fn non_response_bytes(buf: &[u8]) -> Vec<u8> {
         i += 1;
     }
     out
+}
+
+/// A complete graphics reply (`ESC _ G ... ESC \\`) has arrived.
+fn graphics_answered(buf: &[u8]) -> bool {
+    match find(buf, b"\x1b_G") {
+        Some(i) => find(&buf[i + 3..], b"\x1b\\").is_some(),
+        None => false,
+    }
 }
 
 /// A complete OSC 11 reply (`ESC ] 11 ; ... BEL|ST`) has arrived.
@@ -349,26 +394,28 @@ pub fn transmit(out: &mut impl Write, id: u32, png: &[u8]) -> io::Result<()> {
     let mut first = true;
     while let Some(chunk) = chunks.next() {
         let more = if chunks.peek().is_some() { 1 } else { 0 };
-        if first {
-            write!(out, "\x1b_Ga=t,i={id},f=100,t=d,q=2,m={more};")?;
+        let mut seq = if first {
             first = false;
+            format!("\x1b_Ga=t,i={id},f=100,t=d,q=2,m={more};").into_bytes()
         } else {
-            write!(out, "\x1b_Gm={more};")?;
-        }
-        out.write_all(chunk)?;
-        write!(out, "\x1b\\")?;
+            format!("\x1b_Gm={more};").into_bytes()
+        };
+        seq.extend_from_slice(chunk);
+        seq.extend_from_slice(b"\x1b\\");
+        out.write_all(&passthrough(&seq))?;
     }
     Ok(())
 }
 
 /// Creates (or replaces) the virtual placement sizing `id` to cols x rows.
 pub fn place(out: &mut impl Write, id: u32, cols: u16, rows: u16) -> io::Result<()> {
-    write!(out, "\x1b_Ga=p,U=1,i={id},p=1,c={cols},r={rows},q=2\x1b\\")
+    let seq = format!("\x1b_Ga=p,U=1,i={id},p=1,c={cols},r={rows},q=2\x1b\\");
+    out.write_all(&passthrough(seq.as_bytes()))
 }
 
 /// Deletes all transmitted images and placements (used on exit).
 pub fn delete_all(out: &mut impl Write) -> io::Result<()> {
-    write!(out, "\x1b_Ga=d,d=A,q=2\x1b\\")
+    out.write_all(&passthrough(b"\x1b_Ga=d,d=A,q=2\x1b\\"))
 }
 
 /// One placeholder cell: base char + row diacritic + column diacritic.
@@ -392,6 +439,22 @@ mod tests {
         assert_eq!(parse_x_color("rgb:ff/ff/ff"), Some((255, 255, 255)));
         assert_eq!(parse_x_color("rgb:f/0/8"), Some((255, 0, 0x88)));
         assert_eq!(parse_x_color("nonsense"), None);
+    }
+
+    #[test]
+    fn tmux_envelope_doubles_escapes() {
+        assert_eq!(wrap_for_tmux(b"\x1b_Gx\x1b\\", false), b"\x1b_Gx\x1b\\");
+        assert_eq!(
+            wrap_for_tmux(b"\x1b_Gx\x1b\\", true),
+            b"\x1bPtmux;\x1b\x1b_Gx\x1b\x1b\\\x1b\\"
+        );
+    }
+
+    #[test]
+    fn graphics_reply_needs_its_terminator() {
+        assert!(!graphics_answered(b"\x1b_Gi=31;OK"));
+        assert!(graphics_answered(b"\x1b_Gi=31;OK\x1b\\"));
+        assert!(graphics_answered(b"\x1b[?62c\x1b_Gi=31;OK\x1b\\"));
     }
 
     #[test]

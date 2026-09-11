@@ -1362,17 +1362,24 @@ mod tests {
 
     #[test]
     fn kitty_escape_sequences_are_well_formed() {
+        // The test process may itself run inside tmux, in which case the
+        // sequences carry the passthrough envelope; expect accordingly.
+        let tmux = crate::kitty::in_tmux();
+        let wrap = |s: &str| String::from_utf8(crate::kitty::wrap_for_tmux(s.as_bytes(), tmux)).unwrap();
+
         let mut buf = Vec::new();
         crate::kitty::transmit(&mut buf, 3, b"12345").unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with("\x1b_Ga=t,i=3,f=100,t=d,q=2,m=0;"), "{s:?}");
+        let head = wrap("\x1b_Ga=t,i=3,f=100,t=d,q=2,m=0;");
+        let head = &head[..head.len() - if tmux { 2 } else { 0 }]; // drop envelope tail
+        assert!(s.starts_with(head), "{s:?}");
         assert!(s.ends_with("\x1b\\"));
 
         let mut buf = Vec::new();
         crate::kitty::place(&mut buf, 3, 10, 5).unwrap();
         assert_eq!(
             String::from_utf8(buf).unwrap(),
-            "\x1b_Ga=p,U=1,i=3,p=1,c=10,r=5,q=2\x1b\\"
+            wrap("\x1b_Ga=p,U=1,i=3,p=1,c=10,r=5,q=2\x1b\\")
         );
 
         let cell = crate::kitty::placeholder_cell(0, 1).unwrap();
