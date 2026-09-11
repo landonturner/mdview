@@ -161,8 +161,8 @@ Inline code such as `cargo build --release` stays highlighted in prose.
 
 ## Tables
 
-Tables get box-drawing borders, bold headers, and per-column alignment
-(left, center, right):
+Tables get a box-drawing grid, a double rule under the bold header, and
+per-column alignment (left, center, right):
 
 | Pager    | Year | Markdown? |     Verdict |
 |:---------|:----:|:---------:|------------:|

@@ -8,8 +8,8 @@ curl -s https://example.com/notes.md | mdview
 ```
 
 Headings are colored and indexed, paragraphs are reflowed to a configurable
-width, fenced code blocks are syntax-highlighted, tables get box-drawing
-borders, GitHub-style admonitions (`> [!NOTE]`, `> [!WARNING]`, …) get colored
+width, fenced code blocks are syntax-highlighted, tables get a full
+box-drawing grid with a double rule under the header, GitHub-style admonitions (`> [!NOTE]`, `> [!WARNING]`, …) get colored
 bars and titles, and links are emitted as OSC 8 hyperlinks (clickable in
 iTerm2, Ghostty, WezTerm, kitty, and friends). Local images render inline at
 full resolution in any terminal that implements the kitty graphics protocol

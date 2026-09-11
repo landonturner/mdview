@@ -889,28 +889,33 @@ impl<'a> Renderer<'a> {
             widths[widest] -= 1;
         }
 
-        let hborder = |l: &str, m: &str, r: &str| -> String {
+        let hborder = |l: &str, fill: &str, m: &str, r: &str| -> String {
             let mut s = String::from(l);
             for (i, w) in widths.iter().enumerate() {
-                s.push_str(&"─".repeat(w + 2));
+                s.push_str(&fill.repeat(w + 2));
                 s.push_str(if i + 1 == ncols { r } else { m });
             }
             s
         };
 
-        self.push_line(vec![Span::new(hborder("┌", "┬", "┐"), border.clone())]);
+        // Full grid: a rule between every row so wrapped cells stay
+        // unambiguous, and a double rule under the header to set it apart.
+        self.push_line(vec![Span::new(hborder("┌", "─", "┬", "┐"), border.clone())]);
         if !t.head.is_empty() {
             for line in self.table_row(&t.head, &t.aligns, &widths, true, &border) {
                 self.push_line(line);
             }
-            self.push_line(vec![Span::new(hborder("├", "┼", "┤"), border.clone())]);
+            self.push_line(vec![Span::new(hborder("╞", "═", "╪", "╡"), border.clone())]);
         }
-        for row in &t.rows {
+        for (i, row) in t.rows.iter().enumerate() {
+            if i > 0 {
+                self.push_line(vec![Span::new(hborder("├", "─", "┼", "┤"), border.clone())]);
+            }
             for line in self.table_row(row, &t.aligns, &widths, false, &border) {
                 self.push_line(line);
             }
         }
-        self.push_line(vec![Span::new(hborder("└", "┴", "┘"), border)]);
+        self.push_line(vec![Span::new(hborder("└", "─", "┴", "┘"), border)]);
     }
 
     /// Lays out one table row: a single line in compact mode, or as many
