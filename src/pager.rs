@@ -99,6 +99,9 @@ struct HistoryEntry {
     top: usize,
 }
 
+/// Rows the directory view spends on its heading: name, rule, blank.
+const INDEX_HEADER_ROWS: usize = 3;
+
 /// Cheap change detector for hot reload: mtime plus size.
 type FileStamp = (std::time::SystemTime, u64);
 
@@ -645,7 +648,7 @@ impl<'a> Pager<'a> {
     fn key_index(&mut self, key: KeyEvent) {
         let n = self.index.as_ref().map(|i| i.entries.len()).unwrap_or(0);
         let last = n.saturating_sub(1);
-        let page = self.content_h().max(1);
+        let page = self.content_h().saturating_sub(INDEX_HEADER_ROWS).max(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.index_sel = (self.index_sel + 1).min(last),
@@ -677,23 +680,50 @@ impl<'a> Pager<'a> {
         }
     }
 
-    /// Draws the directory listing in the content area: one document per
-    /// row, its path and (dimmed) first heading.
+    /// Draws the directory listing in the content area: the folder name as
+    /// a heading, then one document per row with its path and (dimmed)
+    /// first heading.
     fn draw_index(&mut self, out: &mut io::Stdout) -> Result<()> {
         let rows = self.content_h();
+        let list_rows = rows.saturating_sub(INDEX_HEADER_ROWS).max(1);
         let margin = effective_margin(self.cfg, self.w);
         let avail = (self.w as usize).saturating_sub(margin as usize + 1);
         if self.index_sel < self.index_scroll {
             self.index_scroll = self.index_sel;
-        } else if self.index_sel >= self.index_scroll + rows {
-            self.index_scroll = self.index_sel + 1 - rows;
+        } else if self.index_sel >= self.index_scroll + list_rows {
+            self.index_scroll = self.index_sel + 1 - list_rows;
         }
-        let entries = self.index.as_ref().map(|i| i.entries.as_slice()).unwrap_or(&[]);
-        let rel_w = entries.iter().map(|e| e.rel.as_str().width()).max().unwrap_or(0).min(avail);
         for row in 0..rows {
             queue!(out, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
+        }
+        // Header: the folder name styled like a document's top heading.
+        let name = self
+            .index
+            .as_ref()
+            .and_then(|i| i.root.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| self.title.trim_end_matches('/').to_string());
+        let name = fit(&name, avail);
+        queue!(
+            out,
+            cursor::MoveTo(margin, 0),
+            SetForegroundColor(Color::Magenta),
+            SetAttribute(Attribute::Bold),
+            Print(&name),
+            SetAttribute(Attribute::Reset),
+            cursor::MoveTo(margin, 1),
+            SetForegroundColor(Color::Magenta),
+            Print("━".repeat(name.as_str().width().max(1))),
+            SetAttribute(Attribute::Reset)
+        )?;
+        let entries = self.index.as_ref().map(|i| i.entries.as_slice()).unwrap_or(&[]);
+        let rel_w = entries.iter().map(|e| e.rel.as_str().width()).max().unwrap_or(0).min(avail);
+        for row in 0..list_rows {
+            let y = (row + INDEX_HEADER_ROWS) as u16;
+            if y as usize >= rows {
+                break;
+            }
             let i = self.index_scroll + row;
-            queue!(out, cursor::MoveTo(margin, row as u16))?;
+            queue!(out, cursor::MoveTo(margin, y))?;
             let Some(e) = entries.get(i) else {
                 if entries.is_empty() && row == 0 {
                     queue!(out, SetForegroundColor(Color::DarkGrey), Print("no markdown documents here"), SetAttribute(Attribute::Reset))?;
