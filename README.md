@@ -4,6 +4,7 @@ A `less`-style terminal pager that renders markdown readably.
 
 ```sh
 mdview README.md
+mdview docs/                        # browse a directory of documents
 curl -s https://example.com/notes.md | mdview
 ```
 
@@ -40,6 +41,19 @@ resize, which makes a tmux pane behave like a live preview.
 | Tables | Inline images (kitty graphics — mdview showing its own README) |
 |---|---|
 | ![tables with alignment and wrapped cells](assets/tables.png) | ![mdview rendering an image of itself](assets/inline-images.png) |
+
+## Directory mode
+
+Point mdview at a directory and it lists every markdown document underneath
+it, with each file's first heading alongside. `j`/`k` move, `Enter` opens a
+document, and `q` brings you back to the list; `q` on the list quits. The
+list refreshes itself as files appear, so a folder an agent is filling with
+notes can be left open and browsed as it grows.
+
+![mdview listing the documents in a directory](assets/directory.png)
+
+Piped, `mdview docs/ | cat` prints the same listing as plain text, one
+`path<TAB>title` per line.
 
 ## Live reload
 
@@ -119,7 +133,8 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `o`            | follow a link (hint labels appear)  |
 | `Backspace` / `ctrl-o` | back to the previous document |
 | `h`            | help                                |
-| `q`            | quit                                |
+| `q`            | quit (from a document opened out of a directory list: back to the list) |
+| `Enter`        | open the selected document (directory list) |
 
 Counts work like less: `10j`, `5k`, `42g`.
 

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::index::DirIndex;
 use crate::render::{render, Document, Highlighter, ImageMode, RenderOpts, TermTheme};
 use crate::text::{Line, Style};
 use anyhow::Result;
@@ -20,6 +21,7 @@ pub fn run(
     source: &str,
     title: &str,
     path: Option<&Path>,
+    index: Option<DirIndex>,
     cfg: &Config,
     hl: &Highlighter,
     base: Option<&std::path::Path>,
@@ -33,7 +35,8 @@ pub fn run(
     let result = execute!(out, EnterAlternateScreen, cursor::Hide)
         .map_err(Into::into)
         .and_then(|_| {
-            Pager::new(source, title, path, cfg, hl, base, resolve_links, theme).main_loop(&mut out)
+            Pager::new(source, title, path, index, cfg, hl, base, resolve_links, theme)
+                .main_loop(&mut out)
         });
     let _ = crate::kitty::delete_all(&mut out);
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
@@ -68,6 +71,8 @@ pub fn install_panic_hook() {
 
 enum Mode {
     Normal,
+    /// Directory mode: the list of documents under the opened directory.
+    Index,
     Prompt { backward: bool, buf: String },
     Toc { sel: usize },
     Help,
@@ -130,6 +135,15 @@ struct Pager<'a> {
     tx_queue: std::collections::VecDeque<u32>,
     /// The transfer currently trickling out between input polls.
     tx_current: Option<crate::kitty::Transmission>,
+    /// Directory mode state: the listing, the selected row, the first row
+    /// shown, and when the directory was last rescanned.
+    index: Option<DirIndex>,
+    index_sel: usize,
+    index_scroll: usize,
+    index_scanned: std::time::Instant,
+    /// The document on screen was opened from the directory list, so `q`
+    /// returns there instead of quitting.
+    from_index: bool,
     doc: Document,
     /// When false, mermaid/latex blocks show their source instead.
     diagrams: bool,
@@ -153,6 +167,7 @@ impl<'a> Pager<'a> {
         source: &str,
         title: &str,
         path: Option<&Path>,
+        index: Option<DirIndex>,
         cfg: &'a Config,
         hl: &'a Highlighter,
         base: Option<&std::path::Path>,
@@ -176,7 +191,13 @@ impl<'a> Pager<'a> {
                 theme,
             },
         );
+        let mode = if index.is_some() { Mode::Index } else { Mode::Normal };
         Self {
+            index,
+            index_sel: 0,
+            index_scroll: 0,
+            index_scanned: std::time::Instant::now(),
+            from_index: false,
             source: source.to_string(),
             title: title.to_string(),
             path: path.map(Path::to_path_buf),
@@ -198,7 +219,7 @@ impl<'a> Pager<'a> {
             top: 0,
             w,
             h,
-            mode: Mode::Normal,
+            mode,
             count: String::new(),
             search: None,
             message: None,
@@ -300,9 +321,12 @@ impl<'a> Pager<'a> {
                         self.message = None;
                         match &self.mode {
                             Mode::Normal => self.key_normal(key),
+                            Mode::Index => self.key_index(key),
                             Mode::Prompt { .. } => self.key_prompt(key),
                             Mode::Toc { .. } => self.key_toc(key),
-                            Mode::Help => self.mode = Mode::Normal,
+                            Mode::Help => {
+                                self.mode = if self.viewing_index() { Mode::Index } else { Mode::Normal }
+                            }
                             Mode::Follow { .. } => self.key_follow(key),
                         }
                         changed = true;
@@ -323,6 +347,15 @@ impl<'a> Pager<'a> {
                 changed = true;
             }
             if self.cfg.hot_reload && self.reload_if_changed() {
+                changed = true;
+            }
+            // Directory mode: pick up documents created or renamed since the
+            // last scan (e.g. by an agent writing into the directory).
+            if matches!(self.mode, Mode::Index)
+                && self.cfg.hot_reload
+                && self.index_scanned.elapsed() >= std::time::Duration::from_secs(2)
+                && self.rescan_index()
+            {
                 changed = true;
             }
             if self.images_stale {
@@ -450,6 +483,7 @@ impl<'a> Pager<'a> {
                 self.count.push(c);
                 return;
             }
+            KeyCode::Char('q') if !ctrl && self.from_index => self.show_index(),
             KeyCode::Char('q') | KeyCode::Char('Q') if !ctrl => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
             KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter => {
@@ -533,6 +567,158 @@ impl<'a> Pager<'a> {
             KeyCode::Char(c) => buf.push(c),
             _ => {}
         }
+    }
+
+    /// True while the directory list is what the user is looking at (also
+    /// underneath the help overlay).
+    fn viewing_index(&self) -> bool {
+        self.index.is_some() && !self.from_index && self.source.is_empty()
+    }
+
+    /// Re-reads the directory; returns true when the listing changed.
+    fn rescan_index(&mut self) -> bool {
+        self.index_scanned = std::time::Instant::now();
+        let Some(idx) = &self.index else { return false };
+        let fresh = crate::index::scan(&idx.root);
+        let changed = fresh.entries != idx.entries;
+        if changed {
+            // Keep the selection on the same document if it still exists.
+            let cur = idx.entries.get(self.index_sel).map(|e| e.path.clone());
+            self.index_sel = cur
+                .and_then(|p| fresh.entries.iter().position(|e| e.path == p))
+                .unwrap_or_else(|| self.index_sel.min(fresh.entries.len().saturating_sub(1)));
+            self.index = Some(fresh);
+        }
+        changed
+    }
+
+    /// Returns to the directory list from a document opened out of it.
+    fn show_index(&mut self) {
+        self.source.clear();
+        self.doc = render("", self.hl, &self.render_opts());
+        self.path = None;
+        self.file_stamp = None;
+        self.back_stack.clear();
+        self.search = None;
+        self.message = None;
+        self.from_index = false;
+        self.top = 0;
+        if let Some(idx) = &self.index {
+            self.title = format!(
+                "{}/",
+                idx.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            );
+        }
+        self.rescan_index();
+        self.mode = Mode::Index;
+    }
+
+    /// Opens the selected document from the directory list.
+    fn open_index_entry(&mut self) {
+        let Some(entry) = self.index.as_ref().and_then(|i| i.entries.get(self.index_sel)).cloned()
+        else {
+            return;
+        };
+        let source = match std::fs::read_to_string(&entry.path) {
+            Ok(s) => s,
+            Err(err) => {
+                self.message = Some(format!("{}: {err}", entry.rel));
+                return;
+            }
+        };
+        self.source = source;
+        self.title = entry.rel.clone();
+        self.base = entry.path.canonicalize().ok().and_then(|c| c.parent().map(|d| d.to_path_buf()));
+        self.file_stamp = file_stamp(&entry.path);
+        self.path = Some(entry.path);
+        self.resolve_links = true;
+        self.back_stack.clear();
+        self.doc = render(&self.source, self.hl, &self.render_opts());
+        self.top = 0;
+        self.search = None;
+        self.message = None;
+        self.images_stale = true;
+        self.from_index = true;
+        self.mode = Mode::Normal;
+    }
+
+    fn key_index(&mut self, key: KeyEvent) {
+        let n = self.index.as_ref().map(|i| i.entries.len()).unwrap_or(0);
+        let last = n.saturating_sub(1);
+        let page = self.content_h().max(1);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.index_sel = (self.index_sel + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => self.index_sel = self.index_sel.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.index_sel = 0,
+            KeyCode::Char('G') | KeyCode::End => self.index_sel = last,
+            KeyCode::Char(' ') | KeyCode::PageDown => self.index_sel = (self.index_sel + page).min(last),
+            KeyCode::Char('f') | KeyCode::Char('d') if ctrl => self.index_sel = (self.index_sel + page).min(last),
+            KeyCode::Char('b') | KeyCode::PageUp => self.index_sel = self.index_sel.saturating_sub(page),
+            KeyCode::Char('u') if ctrl => self.index_sel = self.index_sel.saturating_sub(page),
+            KeyCode::Char('d') => self.index_sel = (self.index_sel + page / 2).min(last),
+            KeyCode::Char('u') => self.index_sel = self.index_sel.saturating_sub(page / 2),
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('o') | KeyCode::Right => {
+                self.open_index_entry()
+            }
+            KeyCode::Char('r') => {
+                self.rescan_index();
+            }
+            KeyCode::Char('h') => self.mode = Mode::Help,
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('c') if ctrl => self.quit = true,
+            _ => {}
+        }
+        // Keep the selection on screen.
+        if self.index_sel < self.index_scroll {
+            self.index_scroll = self.index_sel;
+        } else if self.index_sel >= self.index_scroll + page {
+            self.index_scroll = self.index_sel + 1 - page;
+        }
+    }
+
+    /// Draws the directory listing in the content area: one document per
+    /// row, its path and (dimmed) first heading.
+    fn draw_index(&mut self, out: &mut io::Stdout) -> Result<()> {
+        let rows = self.content_h();
+        let margin = effective_margin(self.cfg, self.w);
+        let avail = (self.w as usize).saturating_sub(margin as usize + 1);
+        if self.index_sel < self.index_scroll {
+            self.index_scroll = self.index_sel;
+        } else if self.index_sel >= self.index_scroll + rows {
+            self.index_scroll = self.index_sel + 1 - rows;
+        }
+        let entries = self.index.as_ref().map(|i| i.entries.as_slice()).unwrap_or(&[]);
+        let rel_w = entries.iter().map(|e| e.rel.as_str().width()).max().unwrap_or(0).min(avail);
+        for row in 0..rows {
+            queue!(out, cursor::MoveTo(0, row as u16), Clear(ClearType::UntilNewLine))?;
+            let i = self.index_scroll + row;
+            queue!(out, cursor::MoveTo(margin, row as u16))?;
+            let Some(e) = entries.get(i) else {
+                if entries.is_empty() && row == 0 {
+                    queue!(out, SetForegroundColor(Color::DarkGrey), Print("no markdown documents here"), SetAttribute(Attribute::Reset))?;
+                }
+                continue;
+            };
+            let rel = fit(&e.rel, avail);
+            let pad = rel_w.saturating_sub(rel.as_str().width());
+            if i == self.index_sel {
+                queue!(out, SetAttribute(Attribute::Reverse))?;
+            }
+            queue!(out, Print(&rel))?;
+            if let Some(t) = &e.title {
+                let room = avail.saturating_sub(rel_w + 3);
+                if room >= 4 {
+                    queue!(out, Print(" ".repeat(pad)))?;
+                    if i != self.index_sel {
+                        queue!(out, SetForegroundColor(Color::DarkGrey))?;
+                    }
+                    queue!(out, Print("   "), Print(fit(t, room)))?;
+                }
+            }
+            queue!(out, SetAttribute(Attribute::Reset))?;
+        }
+        Ok(())
     }
 
     fn key_toc(&mut self, key: KeyEvent) {
@@ -664,7 +850,11 @@ impl<'a> Pager<'a> {
     /// Pops the back stack, restoring the previous document and position.
     fn go_back(&mut self) {
         let Some(prev) = self.back_stack.pop() else {
-            self.message = Some("No previous document".into());
+            if self.from_index {
+                self.show_index();
+            } else {
+                self.message = Some("No previous document".into());
+            }
             return;
         };
         self.source = prev.source;
@@ -753,6 +943,16 @@ impl<'a> Pager<'a> {
 
     fn draw(&mut self, out: &mut io::Stdout) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate)?;
+        if matches!(self.mode, Mode::Index) || (matches!(self.mode, Mode::Help) && self.viewing_index()) {
+            self.draw_index(out)?;
+            self.draw_status(out)?;
+            if matches!(self.mode, Mode::Help) {
+                self.draw_help(out)?;
+            }
+            queue!(out, EndSynchronizedUpdate)?;
+            out.flush()?;
+            return Ok(());
+        }
         let rows = self.content_h();
         let margin = effective_margin(self.cfg, self.w);
         for row in 0..rows {
@@ -845,6 +1045,28 @@ impl<'a> Pager<'a> {
             return Ok(());
         }
 
+        if self.viewing_index() {
+            let n = self.index.as_ref().map(|i| i.entries.len()).unwrap_or(0);
+            let right = format!(" {}/{n} ", if n == 0 { 0 } else { self.index_sel + 1 });
+            let left = match &self.message {
+                Some(m) => format!(" {m}"),
+                None => format!(" {}  {n} document{} ", self.title, if n == 1 { "" } else { "s" }),
+            };
+            let w = self.w as usize;
+            let rw = right.as_str().width();
+            let bar = fit(&left, w.saturating_sub(rw));
+            let used = bar.as_str().width();
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(&bar),
+                Print(" ".repeat(w.saturating_sub(used + rw))),
+                Print(&right),
+                SetAttribute(Attribute::Reset)
+            )?;
+            return Ok(());
+        }
+
         let total = self.lines().len();
         let bottom = (self.top + self.content_h()).min(total);
         let right = if total == 0 || bottom >= total {
@@ -912,7 +1134,7 @@ impl<'a> Pager<'a> {
 
     fn draw_help(&self, out: &mut io::Stdout) -> Result<()> {
         let entries: &[(&str, &str)] = &[
-            ("q", "quit"),
+            ("q", "quit (in a listed document: back to the list)"),
             ("j / k, ↓ / ↑", "scroll one line"),
             ("SPACE / b", "page down / up"),
             ("d / u", "half page down / up"),
@@ -926,6 +1148,7 @@ impl<'a> Pager<'a> {
             ("w", "table cells wrapped / compact"),
             ("o", "follow a link (labels appear)"),
             ("BKSP / ^o", "back to previous document"),
+            ("ENTER", "open the selected document (directory list)"),
             ("h", "this help"),
         ];
         let key_w = 14;

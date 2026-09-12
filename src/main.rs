@@ -1,6 +1,7 @@
 mod config;
 mod diagram;
 mod images;
+mod index;
 mod kitty;
 mod pager;
 mod render;
@@ -14,8 +15,11 @@ use text::{Line, Style};
 const USAGE: &str = "\
 mdview - a less-style pager for markdown files
 
-Usage: mdview [OPTIONS] [FILE]
+Usage: mdview [OPTIONS] [FILE|DIR]
        command | mdview
+
+Given a directory, mdview lists the markdown documents in it: j/k or the
+arrows move, Enter opens one, q returns to the list.
 
 Options:
   -w, --width <N>       Reflow paragraphs to at most N columns (default 120,
@@ -109,8 +113,39 @@ fn main() -> Result<()> {
         cfg.wrap_width = if w == 0 { 0 } else { w.max(20) };
     }
 
-    let file_path = args.file.as_deref().filter(|p| *p != "-").map(std::path::PathBuf::from);
+    // Directory mode: list the documents under it instead of reading one.
+    let dir_index = args
+        .file
+        .as_deref()
+        .filter(|p| *p != "-" && std::path::Path::new(p).is_dir())
+        .map(|p| index::scan(std::path::Path::new(p)));
+    if let Some(idx) = &dir_index {
+        if !std::io::stdout().is_terminal() {
+            let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+            for e in &idx.entries {
+                match &e.title {
+                    Some(t) => writeln!(out, "{}\t{t}", e.rel)?,
+                    None => writeln!(out, "{}", e.rel)?,
+                }
+            }
+            return Ok(());
+        }
+    }
+    let file_path = args
+        .file
+        .as_deref()
+        .filter(|p| *p != "-" && dir_index.is_none())
+        .map(std::path::PathBuf::from);
     let (source, title, base) = match &args.file {
+        Some(dir) if dir_index.is_some() => {
+            let root = std::path::Path::new(dir);
+            let name = root
+                .canonicalize()
+                .ok()
+                .and_then(|c| c.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| dir.clone());
+            (String::new(), format!("{name}/"), root.canonicalize().ok())
+        }
         Some(path) if path != "-" => {
             let contents = std::fs::read_to_string(path).with_context(|| format!("cannot read {path}"))?;
             let p = std::path::Path::new(path);
@@ -198,7 +233,7 @@ fn main() -> Result<()> {
     // stdin's base is only a cwd guess, so relative links stay unresolved
     // there rather than pointing at the wrong files.
     let resolve_links = args.file.is_some();
-    pager::run(&source, &title, file_path.as_deref(), &cfg, &hl, base, resolve_links, theme)
+    pager::run(&source, &title, file_path.as_deref(), dir_index, &cfg, &hl, base, resolve_links, theme)
 }
 
 /// Handles `--config`: opens the config file in $EDITOR, seeding it with a
