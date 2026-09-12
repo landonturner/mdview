@@ -37,8 +37,22 @@ pub fn run(
         });
     let _ = crate::kitty::delete_all(&mut out);
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
+    // Swallow any input still queued on the tty (a late terminal reply, a
+    // key typed during teardown) so it cannot echo into the shell prompt
+    // once raw mode is off.
+    drain_input(std::time::Duration::from_millis(30));
     let _ = disable_raw_mode();
     result
+}
+
+/// Discards pending input events for up to `budget`.
+fn drain_input(budget: std::time::Duration) {
+    let deadline = std::time::Instant::now() + budget;
+    while let Ok(true) = event::poll(deadline.saturating_duration_since(std::time::Instant::now())) {
+        if event::read().is_err() {
+            break;
+        }
+    }
 }
 
 /// Restores the terminal even if we panic mid-session.

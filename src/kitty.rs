@@ -184,13 +184,18 @@ pub fn probe_terminal(timeout: std::time::Duration, query_bg: bool) -> Probe {
         }
         // 1x1 RGB query image (id 31), OSC 11 (background color, only when
         // wanted), CSI 16t (cell size), then DA1 as the universal terminator.
-        // Under tmux the graphics and cell-size queries are passed through
-        // to the outer terminal; tmux handles OSC 11 and DA1 itself.
+        // Under tmux the graphics query is passed through to the outer
+        // terminal while tmux handles OSC 11 and DA1 itself. The cell-size
+        // query is skipped there: tmux already reports pixel dimensions on
+        // the pane's tty (the ioctl path), and its reply to a passed-through
+        // query has been seen surfacing as stray input after exit.
         let mut query = passthrough(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
         if query_bg {
             query.extend_from_slice(b"\x1b]11;?\x1b\\");
         }
-        query.extend(passthrough(b"\x1b[16t"));
+        if !in_tmux() {
+            query.extend_from_slice(b"\x1b[16t");
+        }
         query.extend_from_slice(b"\x1b[c");
         if libc::write(fd, query.as_ptr().cast(), query.len()) < 0 {
             if restore {
