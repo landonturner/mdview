@@ -220,18 +220,23 @@ pub fn probe_terminal(timeout: std::time::Duration, query_bg: bool) -> Probe {
                 break;
             }
             buf.extend_from_slice(&chunk[..n as usize]);
-            // Replies that may legitimately arrive after DA1.
-            let trailing = (query_bg && !background_answered(&buf))
-                || (in_tmux() && !graphics_answered(&buf));
+            // Replies that may legitimately arrive after DA1. Under tmux
+            // DA1 is answered instantly by tmux itself while the graphics
+            // reply has to round-trip through the outer terminal, so give
+            // that one the full timeout rather than the short grace window.
+            let bg_missing = query_bg && !background_answered(&buf);
+            let gfx_missing = in_tmux() && !graphics_answered(&buf);
             if da1_answered(&buf) {
-                if !trailing {
+                if !bg_missing && !gfx_missing {
                     break;
                 }
                 if !da1_seen {
                     da1_seen = true;
-                    deadline = deadline.min(std::time::Instant::now() + TRAILING_GRACE);
+                    if !gfx_missing {
+                        deadline = deadline.min(std::time::Instant::now() + TRAILING_GRACE);
+                    }
                 }
-            } else if da1_seen && !trailing {
+            } else if da1_seen && !bg_missing && !gfx_missing {
                 break;
             }
         }
@@ -387,24 +392,63 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Transmits PNG data for `id` (chunked; q=2 suppresses responses).
+/// Transmits PNG data for `id` in one go (chunked; q=2 suppresses
+/// responses). The pager streams via [`Transmission`] instead.
+#[cfg(test)]
 pub fn transmit(out: &mut impl Write, id: u32, png: &[u8]) -> io::Result<()> {
-    let data = base64::engine::general_purpose::STANDARD.encode(png);
-    let mut chunks = data.as_bytes().chunks(4096).peekable();
-    let mut first = true;
-    while let Some(chunk) = chunks.next() {
-        let more = if chunks.peek().is_some() { 1 } else { 0 };
-        let mut seq = if first {
-            first = false;
-            format!("\x1b_Ga=t,i={id},f=100,t=d,q=2,m={more};").into_bytes()
-        } else {
-            format!("\x1b_Gm={more};").into_bytes()
-        };
-        seq.extend_from_slice(chunk);
-        seq.extend_from_slice(b"\x1b\\");
-        out.write_all(&passthrough(&seq))?;
-    }
+    let mut tx = Transmission::new(id, png);
+    while !tx.send_some(out, usize::MAX)? {}
     Ok(())
+}
+
+/// An image transfer that can be sent a few chunks at a time, so the pager
+/// keeps handling input while megabytes of base64 trickle to the terminal.
+pub struct Transmission {
+    id: u32,
+    data: Vec<u8>,
+    pos: usize,
+    started: bool,
+}
+
+/// Bytes of base64 per chunk (kitty's documented maximum).
+const CHUNK: usize = 4096;
+
+impl Transmission {
+    pub fn new(id: u32, png: &[u8]) -> Self {
+        let data = base64::engine::general_purpose::STANDARD.encode(png).into_bytes();
+        Self { id, data, pos: 0, started: false }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Sends up to `max_chunks` chunks. Returns true once the whole image
+    /// has been sent.
+    pub fn send_some(&mut self, out: &mut impl Write, max_chunks: usize) -> io::Result<bool> {
+        for _ in 0..max_chunks {
+            if self.started && self.pos >= self.data.len() {
+                return Ok(true);
+            }
+            let end = (self.pos + CHUNK).min(self.data.len());
+            let more = if end < self.data.len() { 1 } else { 0 };
+            let id = self.id;
+            let mut seq = if self.started {
+                format!("\x1b_Gm={more};").into_bytes()
+            } else {
+                self.started = true;
+                format!("\x1b_Ga=t,i={id},f=100,t=d,q=2,m={more};").into_bytes()
+            };
+            seq.extend_from_slice(&self.data[self.pos..end]);
+            seq.extend_from_slice(b"\x1b\\");
+            out.write_all(&passthrough(&seq))?;
+            self.pos = end;
+            if more == 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 /// Creates (or replaces) the virtual placement sizing `id` to cols x rows.
@@ -439,6 +483,23 @@ mod tests {
         assert_eq!(parse_x_color("rgb:ff/ff/ff"), Some((255, 255, 255)));
         assert_eq!(parse_x_color("rgb:f/0/8"), Some((255, 0, 0x88)));
         assert_eq!(parse_x_color("nonsense"), None);
+    }
+
+    #[test]
+    fn transmission_streams_in_chunks_and_terminates() {
+        let png = vec![7u8; 10_000]; // ~13.3 KB of base64: 4 chunks
+        let mut tx = Transmission::new(9, &png);
+        let mut out = Vec::new();
+        assert!(!tx.send_some(&mut out, 2).unwrap());
+        assert!(tx.send_some(&mut out, 10).unwrap());
+        let s = String::from_utf8_lossy(&out);
+        assert_eq!(s.matches("m=1;").count(), 3);
+        assert_eq!(s.matches("m=0;").count(), 1);
+        assert!(s.contains("a=t,i=9,f=100,t=d,q=2,m=1;"));
+        // Sending again after completion stays complete and emits nothing.
+        let mut more = Vec::new();
+        assert!(tx.send_some(&mut more, 5).unwrap());
+        assert!(more.is_empty());
     }
 
     #[test]

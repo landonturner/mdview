@@ -1,5 +1,6 @@
 mod config;
 mod diagram;
+mod images;
 mod kitty;
 mod pager;
 mod render;

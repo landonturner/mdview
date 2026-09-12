@@ -27,9 +27,12 @@ pub enum ImageMode {
 /// An image queued for kitty-protocol transmission by the pager.
 pub struct KittyImage {
     pub id: u32,
-    pub png: Vec<u8>,
+    pub png: std::sync::Arc<Vec<u8>>,
     pub cols: u16,
     pub rows: u16,
+    /// Index of the first document line holding its placeholder cells, so
+    /// the pager can transmit what is on screen first.
+    pub line: usize,
 }
 /// The terminal's background disposition; drives every hard-coded color.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -694,6 +697,9 @@ impl<'a> Renderer<'a> {
         match self.prepare_kitty_image(&cap.url) {
             Some((id, cols, rows)) => {
                 self.flush_inline();
+                if let Some(img) = self.images.iter_mut().find(|i| i.id == id) {
+                    img.line = self.lines.len();
+                }
                 self.push_placeholder_block(id, cols, rows);
                 let mut caption = Style::default().dim();
                 caption.link = Some(cap.url);
@@ -745,27 +751,29 @@ impl<'a> Renderer<'a> {
         } else {
             self.base?.join(path)
         };
-        let bytes = std::fs::read(&path).ok()?;
-        // kitty renders PNG (f=100); re-encode other formats.
-        let png = if image::guess_format(&bytes).ok() == Some(image::ImageFormat::Png) {
-            bytes
-        } else {
-            let img = image::load_from_memory(&bytes).ok()?;
-            let mut buf = std::io::Cursor::new(Vec::new());
-            img.write_to(&mut buf, image::ImageFormat::Png).ok()?;
-            buf.into_inner()
-        };
-        self.queue_kitty_image(png)
-    }
-
-    /// Sizes a PNG's cell grid and queues it for transmission.
-    fn queue_kitty_image(&mut self, png: Vec<u8>) -> Option<(u32, u16, u16)> {
+        // Prepared off-thread (decoded, downscaled to the display box,
+        // PNG-encoded). Until it is ready this returns None and the image
+        // renders as its caption; the pager re-renders when it lands.
         let ImageMode::Kitty { cell_w, cell_h } = self.image_mode else {
             return None;
         };
-        let (px_w, px_h) = image::load_from_memory(&png)
-            .ok()
-            .map(|i| (i.width().max(1) as f64, i.height().max(1) as f64))?;
+        let max_w = self.avail() as u32 * cell_w.max(1) as u32;
+        let max_h = MAX_IMAGE_ROWS as u32 * cell_h.max(1) as u32;
+        let prepared = crate::images::request(&path, max_w, max_h)?;
+        self.queue_kitty_image(prepared.png.clone(), prepared.width, prepared.height)
+    }
+
+    /// Sizes a PNG's cell grid and queues it for transmission.
+    fn queue_kitty_image(
+        &mut self,
+        png: std::sync::Arc<Vec<u8>>,
+        px_w: u32,
+        px_h: u32,
+    ) -> Option<(u32, u16, u16)> {
+        let ImageMode::Kitty { cell_w, cell_h } = self.image_mode else {
+            return None;
+        };
+        let (px_w, px_h) = (px_w.max(1) as f64, px_h.max(1) as f64);
 
         // Fit the cell grid to the wrap width and a height cap, never
         // upscaling beyond the image's native pixel size.
@@ -790,7 +798,7 @@ impl<'a> Renderer<'a> {
             // Same content appears twice; one virtual placement serves both.
             return Some((id, existing.cols, existing.rows));
         }
-        self.images.push(KittyImage { id, png, cols, rows });
+        self.images.push(KittyImage { id, png, cols, rows, line: self.lines.len() });
         Some((id, cols, rows))
     }
 
@@ -808,9 +816,20 @@ impl<'a> Renderer<'a> {
             _ => None,
         };
         let Some(png) = png else { return false };
-        let Some((id, cols, rows)) = self.queue_kitty_image(png) else {
+        // Header-only read for the dimensions; no full decode.
+        let Some((w, h)) = image::ImageReader::new(std::io::Cursor::new(&png))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+        else {
             return false;
         };
+        let Some((id, cols, rows)) = self.queue_kitty_image(std::sync::Arc::new(png), w, h) else {
+            return false;
+        };
+        if let Some(img) = self.images.iter_mut().find(|i| i.id == id) {
+            img.line = self.lines.len();
+        }
         self.push_placeholder_block(id, cols, rows);
         true
     }
@@ -1325,6 +1344,16 @@ mod tests {
             image_mode: ImageMode::Kitty { cell_w: 8, cell_h: 16 },
             ..topts(80)
         };
+        // Images are prepared off-thread: the first render shows the
+        // caption and raises the dirty flag once the image is ready.
+        let first = render("![a red square](red.png)\n", &hl, &kitty);
+        assert!(first.images.is_empty());
+        assert!(first.lines.iter().any(|l| l.plain().contains("🖼 a red square")));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::images::take_dirty() {
+            assert!(std::time::Instant::now() < deadline, "image never became ready");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let doc = render("![a red square](red.png)\n", &hl, &kitty);
         assert_eq!(doc.images.len(), 1);
         let img = &doc.images[0];

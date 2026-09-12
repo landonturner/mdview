@@ -15,7 +15,10 @@ iTerm2, Ghostty, WezTerm, kitty, and friends). Local images render inline at
 full resolution in any terminal that implements the kitty graphics protocol
 with Unicode placeholders (kitty and Ghostty among them — mdview probes the
 terminal at startup rather than checking names, so protocol-capable terminals
-work automatically); other terminals see a clickable link instead. This
+work automatically); other terminals see a clickable link instead. Images
+never hold up the text: they are decoded and scaled to the display size in the
+background and streamed to the terminal between keystrokes, on-screen ones
+first, so a document full of multi-megabyte screenshots opens instantly. This
 works inside tmux too, once passthrough is on (see [tmux](#tmux)).
 
 Long table cells wrap onto extra lines instead of being cut off (`w` switches

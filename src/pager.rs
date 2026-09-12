@@ -112,6 +112,10 @@ struct Pager<'a> {
     image_mode: ImageMode,
     /// Image ids already transmitted to the terminal this session.
     transmitted: std::collections::HashSet<u32>,
+    /// Images waiting to be transmitted, on-screen ones first.
+    tx_queue: std::collections::VecDeque<u32>,
+    /// The transfer currently trickling out between input polls.
+    tx_current: Option<crate::kitty::Transmission>,
     doc: Document,
     /// When false, mermaid/latex blocks show their source instead.
     diagrams: bool,
@@ -171,6 +175,8 @@ impl<'a> Pager<'a> {
             back_stack: Vec::new(),
             image_mode,
             transmitted: std::collections::HashSet::new(),
+            tx_queue: std::collections::VecDeque::new(),
+            tx_current: None,
             doc,
             diagrams,
             wrap_tables,
@@ -262,13 +268,17 @@ impl<'a> Pager<'a> {
     }
 
     fn main_loop(&mut self, out: &mut io::Stdout) -> Result<()> {
-        self.sync_images(out)?;
+        // Text first; image bytes stream out afterwards between input polls.
         self.draw(out)?;
+        self.sync_images(out)?;
         loop {
             let mut changed = false;
-            // Wake periodically so finished background diagram fetches can be
-            // swapped in without waiting for the next keypress.
-            if event::poll(std::time::Duration::from_millis(250))? {
+            // Wake periodically so finished background diagram fetches and
+            // image preparations can be swapped in without waiting for a
+            // keypress. While a transfer is in flight, don't wait at all.
+            let transferring = self.tx_current.is_some() || !self.tx_queue.is_empty();
+            let wait = if transferring { 0 } else { 250 };
+            if event::poll(std::time::Duration::from_millis(wait))? {
                 match event::read()? {
                     Event::Key(key)
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
@@ -291,8 +301,9 @@ impl<'a> Pager<'a> {
                     _ => {}
                 }
             }
-            if crate::diagram::take_dirty() {
-                // A diagram finished rendering: re-render at current size.
+            if crate::diagram::take_dirty() | crate::images::take_dirty() {
+                // A diagram or image finished preparing: re-render at the
+                // current size so it replaces its caption.
                 self.resize(self.w, self.h);
                 self.images_stale = true;
                 changed = true;
@@ -310,6 +321,7 @@ impl<'a> Pager<'a> {
             if changed {
                 self.draw(out)?;
             }
+            self.pump_images(out)?;
         }
     }
 
@@ -353,14 +365,50 @@ impl<'a> Pager<'a> {
         self.research();
     }
 
-    /// Transmits any images the terminal hasn't seen and (re)creates their
-    /// virtual placements. Placeholder cells in the document do the rest.
+    /// (Re)creates virtual placements for images the terminal already has
+    /// and queues the rest for transmission, on-screen ones first.
+    /// Placeholder cells in the document do the rest.
     fn sync_images(&mut self, out: &mut io::Stdout) -> Result<()> {
+        let view = self.top..self.top + self.content_h();
+        let in_flight = self.tx_current.as_ref().map(|t| t.id());
+        let mut pending: Vec<(bool, usize, u32)> = Vec::new();
         for img in &self.doc.images {
-            if self.transmitted.insert(img.id) {
-                crate::kitty::transmit(out, img.id, &img.png)?;
+            if self.transmitted.contains(&img.id) {
+                crate::kitty::place(out, img.id, img.cols, img.rows)?;
+            } else if Some(img.id) != in_flight && !pending.iter().any(|p| p.2 == img.id) {
+                pending.push((!view.contains(&img.line), img.line, img.id));
             }
-            crate::kitty::place(out, img.id, img.cols, img.rows)?;
+        }
+        pending.sort();
+        self.tx_queue = pending.into_iter().map(|p| p.2).collect();
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Sends a slice of the current image transfer (starting the next queued
+    /// one if idle), then places the image once it has fully arrived.
+    fn pump_images(&mut self, out: &mut io::Stdout) -> Result<()> {
+        if self.tx_current.is_none() {
+            while let Some(id) = self.tx_queue.pop_front() {
+                if let Some(img) = self.doc.images.iter().find(|i| i.id == id) {
+                    self.tx_current = Some(crate::kitty::Transmission::new(id, &img.png));
+                    break;
+                }
+            }
+        }
+        let Some(tx) = self.tx_current.as_mut() else {
+            return Ok(());
+        };
+        // 32 KB of base64 per pass keeps keystrokes responsive even through
+        // tmux passthrough, which parses these byte by byte.
+        let done = tx.send_some(out, 8)?;
+        if done {
+            let id = tx.id();
+            self.tx_current = None;
+            self.transmitted.insert(id);
+            if let Some(img) = self.doc.images.iter().find(|i| i.id == id) {
+                crate::kitty::place(out, img.id, img.cols, img.rows)?;
+            }
         }
         out.flush()?;
         Ok(())
