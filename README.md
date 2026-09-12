@@ -44,13 +44,18 @@ resize, which makes a tmux pane behave like a live preview.
 
 ## Directory mode
 
-Point mdview at a directory and it lists every markdown document underneath
-it, with each file's first heading alongside. `j`/`k` move, `Enter` opens a
-document, and `q` brings you back to the list; `q` on the list quits. The
-list refreshes itself as files appear, so a folder an agent is filling with
-notes can be left open and browsed as it grows.
+Point mdview at a directory and it shows the markdown documents underneath
+it as a file tree: folders first, then documents, each with its first heading
+alongside. `j`/`k` move, `Enter` or `l` expands a folder or opens a document,
+`h` collapses a folder or jumps to its parent, and `H`/`L` collapse or expand
+everything. `q` in an opened document brings you back to the tree; `q` on the
+tree quits. `/` filters as you type, matching paths and titles and showing
+only the branches that match (`Enter` keeps the filter and opens the
+document if only one is left; `Esc` clears it). The tree refreshes itself as
+files appear, so a folder an agent is filling with notes can be left open and
+browsed as it grows.
 
-![mdview listing the documents in a directory](assets/directory.png)
+![mdview showing a directory as a file tree](assets/directory.png)
 
 Piped, `mdview docs/ | cat` prints the same listing as plain text, one
 `path<TAB>title` per line.
@@ -134,7 +139,10 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `Backspace` / `ctrl-o` | back to the previous document |
 | `h`            | help                                |
 | `q`            | quit (from a document opened out of a directory list: back to the list) |
-| `Enter`        | open the selected document (directory list) |
+| `Enter` / `l`  | open a document or expand a folder (directory tree) |
+| `h`            | collapse a folder or go to its parent (directory tree; `?` shows help there) |
+| `H` / `L`      | collapse / expand all folders (directory tree) |
+| `/`            | filter the directory tree as you type |
 
 Counts work like less: `10j`, `5k`, `42g`.
 

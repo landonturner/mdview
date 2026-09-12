@@ -111,3 +111,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// One row of the directory tree: a folder or a document, in depth-first
+/// order with folders before files at each level (the way file explorers
+/// lay things out).
+#[derive(Clone, Debug)]
+pub struct Node {
+    pub name: String,
+    /// `/`-separated path relative to the root (folders have no trailing slash).
+    pub rel: String,
+    pub depth: usize,
+    pub parent: Option<usize>,
+    pub is_dir: bool,
+    /// Index into `DirIndex::entries` for documents.
+    pub entry: Option<usize>,
+    /// Documents anywhere underneath a folder.
+    pub doc_count: usize,
+}
+
+#[derive(Default)]
+struct Folder {
+    /// Keyed by lowercase name for case-insensitive ordering.
+    subdirs: std::collections::BTreeMap<String, (String, Folder)>,
+    files: Vec<(String, usize)>,
+}
+
+impl Folder {
+    fn insert(&mut self, parts: &[&str], entry: usize) {
+        match parts {
+            [] => {}
+            [file] => self.files.push((file.to_string(), entry)),
+            [dir, rest @ ..] => {
+                let key = dir.to_lowercase();
+                let slot = self.subdirs.entry(key).or_insert_with(|| (dir.to_string(), Folder::default()));
+                slot.1.insert(rest, entry);
+            }
+        }
+    }
+
+    fn emit(&self, prefix: &str, depth: usize, parent: Option<usize>, out: &mut Vec<Node>) -> usize {
+        let mut count = 0;
+        for (name, folder) in self.subdirs.values() {
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            let me = out.len();
+            out.push(Node { name: name.clone(), rel: rel.clone(), depth, parent, is_dir: true, entry: None, doc_count: 0 });
+            let n = folder.emit(&rel, depth + 1, Some(me), out);
+            out[me].doc_count = n;
+            count += n;
+        }
+        let mut files = self.files.clone();
+        files.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()).then(a.0.cmp(&b.0)));
+        for (name, entry) in files {
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            out.push(Node { name, rel, depth, parent, is_dir: false, entry: Some(entry), doc_count: 1 });
+            count += 1;
+        }
+        count
+    }
+}
+
+/// Builds the tree rows for a listing.
+pub fn tree(entries: &[DirEntry]) -> Vec<Node> {
+    let mut root = Folder::default();
+    for (i, e) in entries.iter().enumerate() {
+        let parts: Vec<&str> = e.rel.split('/').collect();
+        root.insert(&parts, i);
+    }
+    let mut out = Vec::new();
+    root.emit("", 0, None, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    fn entry(rel: &str) -> DirEntry {
+        DirEntry { rel: rel.to_string(), title: None, path: PathBuf::from(rel) }
+    }
+
+    #[test]
+    fn folders_first_then_files_with_depth_and_counts() {
+        let entries = [entry("zeta.md"), entry("docs/b.md"), entry("docs/api/x.md"), entry("Alpha.md")];
+        let t = tree(&entries);
+        let shape: Vec<(String, usize, bool)> = t.iter().map(|n| (n.rel.clone(), n.depth, n.is_dir)).collect();
+        assert_eq!(
+            shape,
+            [
+                ("docs".to_string(), 0, true),
+                ("docs/api".to_string(), 1, true),
+                ("docs/api/x.md".to_string(), 2, false),
+                ("docs/b.md".to_string(), 1, false),
+                ("Alpha.md".to_string(), 0, false),
+                ("zeta.md".to_string(), 0, false),
+            ]
+        );
+        assert_eq!(t[0].doc_count, 2);
+        assert_eq!(t[1].doc_count, 1);
+        assert_eq!(t[2].parent, Some(1));
+        assert_eq!(t[3].parent, Some(0));
+        assert_eq!(t[4].parent, None);
+    }
+}

@@ -73,6 +73,8 @@ enum Mode {
     Normal,
     /// Directory mode: the list of documents under the opened directory.
     Index,
+    /// Typing a filter for the directory list (`/`).
+    IndexPrompt,
     Prompt { backward: bool, buf: String },
     Toc { sel: usize },
     Help,
@@ -141,9 +143,17 @@ struct Pager<'a> {
     /// Directory mode state: the listing, the selected row, the first row
     /// shown, and when the directory was last rescanned.
     index: Option<DirIndex>,
+    /// `index_sel` and `index_scroll` index the *visible* (filtered) list.
     index_sel: usize,
     index_scroll: usize,
     index_scanned: std::time::Instant,
+    /// Live filter over the directory list: every whitespace-separated term
+    /// must appear in the path or title (smartcase).
+    index_filter: String,
+    /// Tree rows built from the listing (folders first, depth-first).
+    tree: Vec<crate::index::Node>,
+    /// Folders the user has collapsed, by relative path.
+    collapsed: std::collections::HashSet<String>,
     /// The document on screen was opened from the directory list, so `q`
     /// returns there instead of quitting.
     from_index: bool,
@@ -195,11 +205,14 @@ impl<'a> Pager<'a> {
             },
         );
         let mode = if index.is_some() { Mode::Index } else { Mode::Normal };
-        Self {
+        let mut pager = Self {
             index,
             index_sel: 0,
             index_scroll: 0,
             index_scanned: std::time::Instant::now(),
+            index_filter: String::new(),
+            tree: Vec::new(),
+            collapsed: std::collections::HashSet::new(),
             from_index: false,
             source: source.to_string(),
             title: title.to_string(),
@@ -227,7 +240,9 @@ impl<'a> Pager<'a> {
             search: None,
             message: None,
             quit: false,
-        }
+        };
+        pager.rebuild_tree();
+        pager
     }
 
     fn lines(&self) -> &[Line] {
@@ -325,6 +340,7 @@ impl<'a> Pager<'a> {
                         match &self.mode {
                             Mode::Normal => self.key_normal(key),
                             Mode::Index => self.key_index(key),
+                            Mode::IndexPrompt => self.key_index_prompt(key),
                             Mode::Prompt { .. } => self.key_prompt(key),
                             Mode::Toc { .. } => self.key_toc(key),
                             Mode::Help => {
@@ -578,6 +594,11 @@ impl<'a> Pager<'a> {
         self.index.is_some() && !self.from_index && self.source.is_empty()
     }
 
+    /// Rebuilds the tree rows from the listing.
+    fn rebuild_tree(&mut self) {
+        self.tree = self.index.as_ref().map(|i| crate::index::tree(&i.entries)).unwrap_or_default();
+    }
+
     /// Re-reads the directory; returns true when the listing changed.
     fn rescan_index(&mut self) -> bool {
         self.index_scanned = std::time::Instant::now();
@@ -585,12 +606,14 @@ impl<'a> Pager<'a> {
         let fresh = crate::index::scan(&idx.root);
         let changed = fresh.entries != idx.entries;
         if changed {
-            // Keep the selection on the same document if it still exists.
-            let cur = idx.entries.get(self.index_sel).map(|e| e.path.clone());
-            self.index_sel = cur
-                .and_then(|p| fresh.entries.iter().position(|e| e.path == p))
-                .unwrap_or_else(|| self.index_sel.min(fresh.entries.len().saturating_sub(1)));
+            // Keep the selection on the same row if it still exists.
+            let cur = self.visible_rows().get(self.index_sel).map(|&n| self.tree[n].rel.clone());
             self.index = Some(fresh);
+            self.rebuild_tree();
+            let vis = self.visible_rows();
+            self.index_sel = cur
+                .and_then(|rel| vis.iter().position(|&n| self.tree[n].rel == rel))
+                .unwrap_or_else(|| self.index_sel.min(vis.len().saturating_sub(1)));
         }
         changed
     }
@@ -616,10 +639,128 @@ impl<'a> Pager<'a> {
         self.mode = Mode::Index;
     }
 
+    /// Does a document pass the filter? Every whitespace-separated term
+    /// must appear in its path or title (smartcase).
+    fn entry_matches(&self, e: &crate::index::DirEntry) -> bool {
+        let terms: Vec<&str> = self.index_filter.split_whitespace().collect();
+        if terms.is_empty() {
+            return true;
+        }
+        let smart_lower = self.index_filter.chars().all(|c| !c.is_uppercase());
+        let mut hay = e.rel.clone();
+        if let Some(t) = &e.title {
+            hay.push(' ');
+            hay.push_str(t);
+        }
+        if smart_lower {
+            hay = hay.to_lowercase();
+        }
+        terms.iter().all(|t| hay.contains(t))
+    }
+
+    /// Tree rows currently on show: collapsed folders hide their subtree;
+    /// with a filter active only matching documents and the folders leading
+    /// to them appear (all expanded).
+    fn visible_rows(&self) -> Vec<usize> {
+        let Some(idx) = &self.index else { return Vec::new() };
+        let filtering = !self.index_filter.split_whitespace().next().is_none();
+        let mut keep = vec![!filtering; self.tree.len()];
+        if filtering {
+            for (i, n) in self.tree.iter().enumerate() {
+                if let Some(e) = n.entry.and_then(|k| idx.entries.get(k)) {
+                    if self.entry_matches(e) {
+                        keep[i] = true;
+                        let mut p = n.parent;
+                        while let Some(pi) = p {
+                            keep[pi] = true;
+                            p = self.tree[pi].parent;
+                        }
+                    }
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        let mut skip_below: Option<usize> = None;
+        for (i, n) in self.tree.iter().enumerate() {
+            if let Some(d) = skip_below {
+                if n.depth > d {
+                    continue;
+                }
+                skip_below = None;
+            }
+            if !keep[i] {
+                continue;
+            }
+            rows.push(i);
+            if n.is_dir && !filtering && self.collapsed.contains(&n.rel) {
+                skip_below = Some(n.depth);
+            }
+        }
+        rows
+    }
+
+    fn selected_node(&self) -> Option<&crate::index::Node> {
+        let vis = self.visible_rows();
+        self.tree.get(*vis.get(self.index_sel)?)
+    }
+
+    fn selected_entry(&self) -> Option<&crate::index::DirEntry> {
+        let k = self.selected_node()?.entry?;
+        self.index.as_ref()?.entries.get(k)
+    }
+
+    /// Moves the selection to the row showing `node`, if visible.
+    fn select_node(&mut self, node: usize) {
+        if let Some(pos) = self.visible_rows().iter().position(|&n| n == node) {
+            self.index_sel = pos;
+        }
+    }
+
+    /// Handles keys while typing a directory-list filter: the list narrows
+    /// as you type; Enter keeps the filter, Esc clears it.
+    fn key_index_prompt(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.index_filter.clear();
+                self.mode = Mode::Index;
+            }
+            KeyCode::Char('c') if ctrl => {
+                self.index_filter.clear();
+                self.mode = Mode::Index;
+            }
+            KeyCode::Char('u') if ctrl => self.index_filter.clear(),
+            KeyCode::Backspace => {
+                if self.index_filter.pop().is_none() {
+                    self.mode = Mode::Index;
+                }
+            }
+            KeyCode::Enter => {
+                self.mode = Mode::Index;
+                // A filter that narrowed to a single document: just open it.
+                let docs: Vec<usize> = self
+                    .visible_rows()
+                    .into_iter()
+                    .filter(|&n| !self.tree[n].is_dir)
+                    .collect();
+                if docs.len() == 1 {
+                    self.select_node(docs[0]);
+                    self.open_index_entry();
+                    return;
+                }
+            }
+            KeyCode::Char(c) if !ctrl => self.index_filter.push(c),
+            _ => return,
+        }
+        // Land on the first document rather than a folder row.
+        let vis = self.visible_rows();
+        self.index_sel = vis.iter().position(|&n| !self.tree[n].is_dir).unwrap_or(0);
+        self.index_scroll = 0;
+    }
+
     /// Opens the selected document from the directory list.
     fn open_index_entry(&mut self) {
-        let Some(entry) = self.index.as_ref().and_then(|i| i.entries.get(self.index_sel)).cloned()
-        else {
+        let Some(entry) = self.selected_entry().cloned() else {
             return;
         };
         let source = match std::fs::read_to_string(&entry.path) {
@@ -646,10 +787,13 @@ impl<'a> Pager<'a> {
     }
 
     fn key_index(&mut self, key: KeyEvent) {
-        let n = self.index.as_ref().map(|i| i.entries.len()).unwrap_or(0);
+        let vis = self.visible_rows();
+        let n = vis.len();
         let last = n.saturating_sub(1);
         let page = self.content_h().saturating_sub(INDEX_HEADER_ROWS).max(1);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let cur = vis.get(self.index_sel).copied();
+        let filtering = !self.index_filter.trim().is_empty();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.index_sel = (self.index_sel + 1).min(last),
             KeyCode::Char('k') | KeyCode::Up => self.index_sel = self.index_sel.saturating_sub(1),
@@ -661,18 +805,67 @@ impl<'a> Pager<'a> {
             KeyCode::Char('u') if ctrl => self.index_sel = self.index_sel.saturating_sub(page),
             KeyCode::Char('d') => self.index_sel = (self.index_sel + page / 2).min(last),
             KeyCode::Char('u') => self.index_sel = self.index_sel.saturating_sub(page / 2),
-            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('o') | KeyCode::Right => {
-                self.open_index_entry()
+            // Enter toggles a folder or opens a document.
+            KeyCode::Enter => match cur.map(|i| &self.tree[i]) {
+                Some(node) if node.is_dir => {
+                    if !filtering {
+                        let rel = node.rel.clone();
+                        if !self.collapsed.remove(&rel) {
+                            self.collapsed.insert(rel);
+                        }
+                    }
+                }
+                Some(_) => self.open_index_entry(),
+                None => {}
+            },
+            // l / → expands a folder (or opens a document).
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('o') => match cur.map(|i| &self.tree[i]) {
+                Some(node) if node.is_dir => {
+                    self.collapsed.remove(&node.rel.clone());
+                }
+                Some(_) => self.open_index_entry(),
+                None => {}
+            },
+            // h / ← collapses an expanded folder, else jumps to the parent.
+            KeyCode::Char('h') | KeyCode::Left => {
+                if let Some(i) = cur {
+                    let node = &self.tree[i];
+                    if node.is_dir && !filtering && !self.collapsed.contains(&node.rel) {
+                        self.collapsed.insert(node.rel.clone());
+                    } else if let Some(p) = node.parent {
+                        self.select_node(p);
+                    }
+                }
             }
+            KeyCode::Char('H') => {
+                let cur_rel = cur.map(|i| self.tree[i].rel.clone());
+                self.collapsed = self.tree.iter().filter(|n| n.is_dir).map(|n| n.rel.clone()).collect();
+                // Stay on the top-level ancestor of what was selected.
+                if let Some(rel) = cur_rel {
+                    let top = rel.split('/').next().unwrap_or("").to_string();
+                    if let Some(i) = self.tree.iter().position(|n| n.rel == top) {
+                        self.select_node(i);
+                    }
+                }
+            }
+            KeyCode::Char('L') => self.collapsed.clear(),
             KeyCode::Char('r') => {
                 self.rescan_index();
             }
-            KeyCode::Char('h') => self.mode = Mode::Help,
+            KeyCode::Char('?') => self.mode = Mode::Help,
+            KeyCode::Char('/') => self.mode = Mode::IndexPrompt,
+            KeyCode::Esc if filtering => {
+                self.index_filter.clear();
+                self.index_sel = 0;
+                self.index_scroll = 0;
+            }
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
             _ => {}
         }
-        // Keep the selection on screen.
+        // Keep the selection valid and on screen.
+        let n = self.visible_rows().len();
+        self.index_sel = self.index_sel.min(n.saturating_sub(1));
         if self.index_sel < self.index_scroll {
             self.index_scroll = self.index_sel;
         } else if self.index_sel >= self.index_scroll + page {
@@ -680,9 +873,9 @@ impl<'a> Pager<'a> {
         }
     }
 
-    /// Draws the directory listing in the content area: the folder name as
-    /// a heading, then one document per row with its path and (dimmed)
-    /// first heading.
+    /// Draws the directory tree in the content area: the folder name as a
+    /// heading, then folders (chevron + icon, with a document count) and
+    /// documents (icon, name, dimmed first heading), indented by depth.
     fn draw_index(&mut self, out: &mut io::Stdout) -> Result<()> {
         let rows = self.content_h();
         let list_rows = rows.saturating_sub(INDEX_HEADER_ROWS).max(1);
@@ -715,35 +908,67 @@ impl<'a> Pager<'a> {
             Print("━".repeat(name.as_str().width().max(1))),
             SetAttribute(Attribute::Reset)
         )?;
+
         let entries = self.index.as_ref().map(|i| i.entries.as_slice()).unwrap_or(&[]);
-        let rel_w = entries.iter().map(|e| e.rel.as_str().width()).max().unwrap_or(0).min(avail);
+        let visible = self.visible_rows();
+        let filtering = !self.index_filter.trim().is_empty();
+        // Label = indent + chevron/icon + name; titles line up after the
+        // widest label on screen.
+        let label = |n: &crate::index::Node| -> String {
+            let indent = "  ".repeat(n.depth);
+            if n.is_dir {
+                let open = filtering || !self.collapsed.contains(&n.rel);
+                format!("{indent}{} {}", if open { "▾ 📂" } else { "▸ 📁" }, n.name)
+            } else {
+                format!("{indent}  📄 {}", n.name)
+            }
+        };
+        let label_w = visible
+            .iter()
+            .skip(self.index_scroll)
+            .take(list_rows)
+            .map(|&i| label(&self.tree[i]).as_str().width())
+            .max()
+            .unwrap_or(0)
+            .min(avail);
         for row in 0..list_rows {
             let y = (row + INDEX_HEADER_ROWS) as u16;
             if y as usize >= rows {
                 break;
             }
-            let i = self.index_scroll + row;
+            let r = self.index_scroll + row;
             queue!(out, cursor::MoveTo(margin, y))?;
-            let Some(e) = entries.get(i) else {
-                if entries.is_empty() && row == 0 {
-                    queue!(out, SetForegroundColor(Color::DarkGrey), Print("no markdown documents here"), SetAttribute(Attribute::Reset))?;
+            let Some(&i) = visible.get(r) else {
+                if visible.is_empty() && row == 0 {
+                    let msg = if entries.is_empty() { "no markdown documents here" } else { "no documents match" };
+                    queue!(out, SetForegroundColor(Color::DarkGrey), Print(msg), SetAttribute(Attribute::Reset))?;
                 }
                 continue;
             };
-            let rel = fit(&e.rel, avail);
-            let pad = rel_w.saturating_sub(rel.as_str().width());
-            if i == self.index_sel {
+            let node = &self.tree[i];
+            let text = fit(&label(node), avail);
+            let pad = label_w.saturating_sub(text.as_str().width());
+            let selected = r == self.index_sel;
+            if selected {
                 queue!(out, SetAttribute(Attribute::Reverse))?;
             }
-            queue!(out, Print(&rel))?;
-            if let Some(t) = &e.title {
-                let room = avail.saturating_sub(rel_w + 3);
+            if node.is_dir && !selected {
+                queue!(out, SetAttribute(Attribute::Bold))?;
+            }
+            queue!(out, Print(&text))?;
+            let detail = if node.is_dir {
+                Some(format!("{} document{}", node.doc_count, if node.doc_count == 1 { "" } else { "s" }))
+            } else {
+                node.entry.and_then(|k| entries.get(k)).and_then(|e| e.title.clone())
+            };
+            if let Some(d) = detail {
+                let room = avail.saturating_sub(label_w + 3);
                 if room >= 4 {
-                    queue!(out, Print(" ".repeat(pad)))?;
-                    if i != self.index_sel {
+                    queue!(out, SetAttribute(Attribute::NormalIntensity), Print(" ".repeat(pad)))?;
+                    if !selected {
                         queue!(out, SetForegroundColor(Color::DarkGrey))?;
                     }
-                    queue!(out, Print("   "), Print(fit(t, room)))?;
+                    queue!(out, Print("   "), Print(fit(&d, room)))?;
                 }
             }
             queue!(out, SetAttribute(Attribute::Reset))?;
@@ -973,7 +1198,9 @@ impl<'a> Pager<'a> {
 
     fn draw(&mut self, out: &mut io::Stdout) -> Result<()> {
         queue!(out, BeginSynchronizedUpdate)?;
-        if matches!(self.mode, Mode::Index) || (matches!(self.mode, Mode::Help) && self.viewing_index()) {
+        if matches!(self.mode, Mode::Index | Mode::IndexPrompt)
+            || (matches!(self.mode, Mode::Help) && self.viewing_index())
+        {
             self.draw_index(out)?;
             self.draw_status(out)?;
             if matches!(self.mode, Mode::Help) {
@@ -1075,12 +1302,21 @@ impl<'a> Pager<'a> {
             return Ok(());
         }
 
+        if matches!(self.mode, Mode::IndexPrompt) {
+            queue!(out, Print(fit(&format!("/{}", self.index_filter), self.w as usize)))?;
+            return Ok(());
+        }
         if self.viewing_index() {
-            let n = self.index.as_ref().map(|i| i.entries.len()).unwrap_or(0);
-            let right = format!(" {}/{n} ", if n == 0 { 0 } else { self.index_sel + 1 });
+            let total = self.index.as_ref().map(|i| i.entries.len()).unwrap_or(0);
+            let rows = self.visible_rows();
+            let n = rows.iter().filter(|&&i| !self.tree[i].is_dir).count();
+            let right = format!(" {}/{} ", if rows.is_empty() { 0 } else { self.index_sel + 1 }, rows.len());
             let left = match &self.message {
                 Some(m) => format!(" {m}"),
-                None => format!(" {}  {n} document{} ", self.title, if n == 1 { "" } else { "s" }),
+                None if self.index_filter.is_empty() => {
+                    format!(" {}  {total} document{} ", self.title, if total == 1 { "" } else { "s" })
+                }
+                None => format!(" {}  {n} of {total} match /{} ", self.title, self.index_filter),
             };
             let w = self.w as usize;
             let rw = right.as_str().width();
@@ -1178,7 +1414,11 @@ impl<'a> Pager<'a> {
             ("w", "table cells wrapped / compact"),
             ("o", "follow a link (labels appear)"),
             ("BKSP / ^o", "back to previous document"),
-            ("ENTER", "open the selected document (directory list)"),
+            ("ENTER / l", "open a document or expand a folder (directory list)"),
+            ("h", "collapse a folder / go to its parent (directory list)"),
+            ("H / L", "collapse / expand all folders (directory list)"),
+            ("/", "filter the directory list as you type"),
+            ("?", "this help (directory list)"),
             ("h", "this help"),
         ];
         let key_w = 14;
