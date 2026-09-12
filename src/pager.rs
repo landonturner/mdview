@@ -3,6 +3,7 @@ use crate::index::DirIndex;
 use crate::render::{render, Document, Highlighter, ImageMode, RenderOpts, TermTheme};
 use crate::text::{Line, Style};
 use anyhow::Result;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -35,10 +36,16 @@ pub fn run(
     let result = execute!(out, EnterAlternateScreen, cursor::Hide)
         .map_err(Into::into)
         .and_then(|_| {
+            if cfg.mouse {
+                execute!(out, crossterm::event::EnableMouseCapture)?;
+            }
             Pager::new(source, title, path, index, cfg, hl, base, resolve_links, theme)
                 .main_loop(&mut out)
         });
     let _ = crate::kitty::delete_all(&mut out);
+    if cfg.mouse {
+        let _ = execute!(out, crossterm::event::DisableMouseCapture);
+    }
     let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
     // Swallow any input still queued on the tty (a late terminal reply, a
     // key typed during teardown) so it cannot echo into the shell prompt
@@ -63,6 +70,7 @@ pub fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let mut out = io::stdout();
+        let _ = execute!(out, crossterm::event::DisableMouseCapture);
         let _ = execute!(out, cursor::Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         default(info);
@@ -354,6 +362,12 @@ impl<'a> Pager<'a> {
                         self.resize(w, h);
                         self.sync_images(out)?;
                         changed = true;
+                    }
+                    Event::Mouse(m) => {
+                        if self.mouse(m) {
+                            self.message = None;
+                            changed = true;
+                        }
                     }
                     _ => {}
                 }
@@ -976,6 +990,116 @@ impl<'a> Pager<'a> {
         Ok(())
     }
 
+    /// Mouse input: wheel scrolls; a left click follows the link, opens the
+    /// image, or selects/activates the directory-tree row under it.
+    /// Returns true when something changed on screen.
+    fn mouse(&mut self, m: MouseEvent) -> bool {
+        let (col, row) = (m.column as usize, m.row as usize);
+        let in_content = row < self.content_h();
+        match m.kind {
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let delta: i64 = if matches!(m.kind, MouseEventKind::ScrollDown) { 3 } else { -3 };
+                match self.mode {
+                    Mode::Index | Mode::IndexPrompt => {
+                        let n = self.visible_rows().len();
+                        let sel = (self.index_sel as i64 + delta).clamp(0, n.saturating_sub(1) as i64);
+                        self.index_sel = sel as usize;
+                    }
+                    Mode::Help | Mode::Toc { .. } => return false,
+                    _ => self.scroll(delta),
+                }
+                true
+            }
+            MouseEventKind::Down(MouseButton::Left) => match self.mode {
+                Mode::Help | Mode::Toc { .. } => {
+                    self.mode = if self.viewing_index() { Mode::Index } else { Mode::Normal };
+                    true
+                }
+                Mode::Index | Mode::IndexPrompt => {
+                    if !in_content || row < INDEX_HEADER_ROWS {
+                        return false;
+                    }
+                    let r = self.index_scroll + row - INDEX_HEADER_ROWS;
+                    let vis = self.visible_rows();
+                    if r >= vis.len() {
+                        return false;
+                    }
+                    if r == self.index_sel {
+                        // Second click on the selected row acts like Enter.
+                        self.mode = Mode::Index;
+                        self.key_index(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    } else {
+                        self.index_sel = r;
+                    }
+                    true
+                }
+                Mode::Follow { .. } | Mode::Normal | Mode::Prompt { .. } => {
+                    if !in_content {
+                        return false;
+                    }
+                    self.mode = Mode::Normal;
+                    self.click_content(col, row)
+                }
+            },
+            _ => false,
+        }
+    }
+
+    /// A left click at screen (col, row) inside the document: opens the
+    /// image whose cells were clicked, or follows the link under the cursor.
+    fn click_content(&mut self, col: usize, row: usize) -> bool {
+        let idx = self.top + row;
+        if idx >= self.lines().len() {
+            return false;
+        }
+        // Inline image: the placeholder block spans `rows` lines from `line`.
+        if let Some(src) = self
+            .doc
+            .images
+            .iter()
+            .find(|img| idx >= img.line && idx < img.line + img.rows as usize)
+            .and_then(|img| img.src.clone())
+        {
+            let target = self.resolve_image_path(&src);
+            open_external(&target, &mut self.message);
+            return true;
+        }
+        let margin = effective_margin(self.cfg, self.w) as usize;
+        if col < margin {
+            return false;
+        }
+        let x = col - margin;
+        let mut at = 0usize;
+        let mut url: Option<String> = None;
+        for span in &self.lines()[idx].spans {
+            let w = span.width();
+            if x < at + w {
+                url = span.style.link.clone();
+                break;
+            }
+            at += w;
+        }
+        match url {
+            Some(u) => {
+                self.follow_link(&u);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Image sources are as written in the document; make relative ones
+    /// absolute against the document's directory for the opener.
+    fn resolve_image_path(&self, src: &str) -> String {
+        if src.contains("://") || Path::new(src).is_absolute() {
+            return src.to_string();
+        }
+        match &self.base {
+            Some(b) => b.join(src).to_string_lossy().into_owned(),
+            None => src.to_string(),
+        }
+    }
+
     fn key_toc(&mut self, key: KeyEvent) {
         let Mode::Toc { sel, .. } = &mut self.mode else { return };
         let last = self.doc.headings.len().saturating_sub(1);
@@ -1419,6 +1543,7 @@ impl<'a> Pager<'a> {
             ("H / L", "collapse / expand all folders (directory list)"),
             ("/", "filter the directory list as you type"),
             ("?", "this help (directory list)"),
+            ("mouse", "click links, images, tree rows; wheel scrolls"),
             ("h", "this help"),
         ];
         let key_w = 14;

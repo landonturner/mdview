@@ -198,6 +198,9 @@ hot_reload = true
 
 # Long table cells: "wrap" onto extra lines, or "compact" (one line, cut with …).
 table_view = "wrap"
+
+# Click links/images/tree rows and scroll with the wheel (Shift-drag to select text).
+mouse = true
 ```
 
 All keys are optional; `--width` overrides the file.
@@ -205,6 +208,14 @@ All keys are optional; `--width` overrides the file.
 `table_view = "wrap"` (the default) folds long table cells onto extra lines so
 nothing is cut off; `"compact"` keeps one line per row and trims overflow with
 `…`. Either way, `w` in the pager switches between the two.
+
+`mouse = true` (the default) lets you click a link to follow it (markdown
+links open inside mdview, web links in the browser), click an image to open it
+in your image viewer, click rows in the directory tree, and scroll with the
+wheel. While the mouse is captured, select text by holding Shift while
+dragging (Ghostty, kitty, iTerm2, WezTerm); set `mouse = false` to hand the
+mouse back to the terminal. Inside tmux, `set -g mouse on` is needed for
+clicks to reach the pane.
 
 `hot_reload = true` (the default) makes mdview re-read the file whenever it
 changes on disk and re-render in place, keeping your scroll position, so a

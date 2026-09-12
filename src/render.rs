@@ -30,6 +30,9 @@ pub struct KittyImage {
     pub png: std::sync::Arc<Vec<u8>>,
     pub cols: u16,
     pub rows: u16,
+    /// The image's source path/URL (None for rendered diagrams), so a click
+    /// on it can open the file.
+    pub src: Option<String>,
     /// Index of the first document line holding its placeholder cells, so
     /// the pager can transmit what is on screen first.
     pub line: usize,
@@ -699,6 +702,7 @@ impl<'a> Renderer<'a> {
                 self.flush_inline();
                 if let Some(img) = self.images.iter_mut().find(|i| i.id == id) {
                     img.line = self.lines.len();
+                    img.src = Some(cap.url.clone());
                 }
                 self.push_placeholder_block(id, cols, rows);
                 let mut caption = Style::default().dim();
@@ -798,7 +802,7 @@ impl<'a> Renderer<'a> {
             // Same content appears twice; one virtual placement serves both.
             return Some((id, existing.cols, existing.rows));
         }
-        self.images.push(KittyImage { id, png, cols, rows, line: self.lines.len() });
+        self.images.push(KittyImage { id, png, cols, rows, src: None, line: self.lines.len() });
         Some((id, cols, rows))
     }
 

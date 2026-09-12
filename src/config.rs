@@ -29,6 +29,10 @@ pub struct Config {
     /// How table cells that don't fit start out: "wrap" onto extra lines, or
     /// "compact" (one line per row, cut with …). Toggled in the pager with w.
     pub table_view: String,
+    /// Capture the mouse: click links and images, click rows in the
+    /// directory tree, scroll with the wheel. Off leaves the mouse to the
+    /// terminal (plain drag-to-select).
+    pub mouse: bool,
 }
 
 impl Default for Config {
@@ -41,6 +45,7 @@ impl Default for Config {
             default_view: "rendered".to_string(),
             hot_reload: true,
             table_view: "wrap".to_string(),
+            mouse: true,
         }
     }
 }
@@ -101,6 +106,11 @@ hot_reload = true
 # Table cells that don't fit: "wrap" onto extra lines, or "compact" (one
 # line per row, cut with …). Toggle in the pager with w.
 table_view = "wrap"
+
+# Mouse support: click links and images, click rows in the directory tree,
+# scroll with the wheel. With it on, select text by holding Shift while
+# dragging (most terminals); set false to leave the mouse to the terminal.
+mouse = true
 "#;
 
 /// Validates the config file, returning an error message if it won't load
