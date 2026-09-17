@@ -49,8 +49,10 @@ it as a file tree: folders first, then documents, each with its first heading
 alongside. `j`/`k` move, `Enter` or `l` expands a folder or opens a document,
 `h` collapses a folder or jumps to its parent, and `H`/`L` collapse or expand
 everything. `q` in an opened document brings you back to the tree; `q` on the
-tree quits. `/` filters as you type, matching paths and titles and showing
-only the branches that match (`Enter` keeps the filter and opens the
+tree quits. `/` fuzzy-filters as you type, matching characters in order in
+paths and titles (for example, `fb` matches `foobar`) and showing
+only the branches that match (`Ctrl+J`/`Ctrl+K` move the selection down/up
+while filtering; `Enter` keeps the filter and selection and opens the
 document if only one is left; `Esc` clears it). The tree refreshes itself as
 files appear, so a folder an agent is filling with notes can be left open and
 browsed as it grows.

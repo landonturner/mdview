@@ -156,7 +156,7 @@ struct Pager<'a> {
     index_scroll: usize,
     index_scanned: std::time::Instant,
     /// Live filter over the directory list: every whitespace-separated term
-    /// must appear in the path or title (smartcase).
+    /// must fuzzy-match the path or title (smartcase).
     index_filter: String,
     /// Tree rows built from the listing (folders first, depth-first).
     tree: Vec<crate::index::Node>,
@@ -654,7 +654,7 @@ impl<'a> Pager<'a> {
     }
 
     /// Does a document pass the filter? Every whitespace-separated term
-    /// must appear in its path or title (smartcase).
+    /// must match characters in order in its path or title (smartcase).
     fn entry_matches(&self, e: &crate::index::DirEntry) -> bool {
         let terms: Vec<&str> = self.index_filter.split_whitespace().collect();
         if terms.is_empty() {
@@ -669,7 +669,10 @@ impl<'a> Pager<'a> {
         if smart_lower {
             hay = hay.to_lowercase();
         }
-        terms.iter().all(|t| hay.contains(t))
+        terms.iter().all(|t| {
+            let mut chars = hay.chars();
+            t.chars().all(|wanted| chars.any(|c| c == wanted))
+        })
     }
 
     /// Tree rows currently on show: collapsed folders hide their subtree;
@@ -735,6 +738,10 @@ impl<'a> Pager<'a> {
     fn key_index_prompt(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('j' | 'k') if ctrl => {
+                self.key_index(key);
+                return;
+            }
             KeyCode::Esc => {
                 self.index_filter.clear();
                 self.mode = Mode::Index;
@@ -760,8 +767,8 @@ impl<'a> Pager<'a> {
                 if docs.len() == 1 {
                     self.select_node(docs[0]);
                     self.open_index_entry();
-                    return;
                 }
+                return;
             }
             KeyCode::Char(c) if !ctrl => self.index_filter.push(c),
             _ => return,
@@ -1541,7 +1548,8 @@ impl<'a> Pager<'a> {
             ("ENTER / l", "open a document or expand a folder (directory list)"),
             ("h", "collapse a folder / go to its parent (directory list)"),
             ("H / L", "collapse / expand all folders (directory list)"),
-            ("/", "filter the directory list as you type"),
+            ("/", "fuzzy-filter the directory list as you type"),
+            ("^j / ^k", "move down / up while filtering the directory list"),
             ("?", "this help (directory list)"),
             ("mouse", "click links, images, tree rows; wheel scrolls"),
             ("h", "this help"),
@@ -1841,11 +1849,89 @@ fn nearest_match(matches: &[(usize, usize, usize)], top: usize) -> usize {
 mod tests {
     use super::*;
     use crate::text::Span;
+    use std::path::PathBuf;
 
     fn line(s: &str) -> Line {
         let mut l = Line::default();
         l.push(Span::plain(s));
         l
+    }
+
+    #[test]
+    fn directory_filter_navigation_preserves_query_and_selection() {
+        let cfg = Config::default();
+        let hl = Highlighter::new("base16-ocean.dark");
+        let index = DirIndex {
+            root: PathBuf::from("."),
+            entries: (0..6)
+                .map(|i| crate::index::DirEntry {
+                    rel: format!("doc{i}.md"),
+                    title: None,
+                    path: PathBuf::from(format!("doc{i}.md")),
+                })
+                .collect(),
+        };
+        let mut pager = Pager::new("", "", None, Some(index), &cfg, &hl, None, false, TermTheme::Dark);
+        pager.h = 6; // Two list rows, plus the header and status line.
+        pager.mode = Mode::IndexPrompt;
+        pager.index_filter = "doc".into();
+        let down = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL);
+        let up = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        pager.key_index_prompt(down);
+        assert_eq!(pager.index_sel, 1);
+        for _ in 0..10 {
+            pager.key_index_prompt(down);
+        }
+        assert_eq!(pager.index_sel, 5);
+        assert_eq!(pager.index_scroll, 4);
+        pager.key_index_prompt(up);
+        assert_eq!(pager.index_sel, 4);
+        assert_eq!(pager.index_filter, "doc");
+        assert!(matches!(pager.mode, Mode::IndexPrompt));
+        pager.key_index_prompt(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(pager.mode, Mode::Index));
+        assert_eq!(pager.index_sel, 4);
+        assert_eq!(pager.index_scroll, 4);
+        pager.mode = Mode::IndexPrompt;
+        for _ in 0..10 {
+            pager.key_index_prompt(up);
+        }
+        assert_eq!(pager.index_sel, 0);
+        assert_eq!(pager.index_scroll, 0);
+        // Plain j/k still edit the query; navigation is safe with no matches.
+        for c in ['j', 'k'] {
+            pager.key_index_prompt(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(pager.index_filter, "docjk");
+        assert!(pager.visible_rows().is_empty());
+        pager.key_index_prompt(down);
+        pager.key_index_prompt(up);
+        assert_eq!(pager.index_sel, 0);
+        assert_eq!(pager.index_scroll, 0);
+    }
+
+    #[test]
+    fn directory_filter_fuzzy_matches_paths_and_titles() {
+        let cfg = Config::default();
+        let hl = Highlighter::new("base16-ocean.dark");
+        let entry = crate::index::DirEntry {
+            rel: "foobar/notes.md".into(),
+            title: Some("Quick Café".into()),
+            path: PathBuf::from("foobar/notes.md"),
+        };
+        let index = DirIndex { root: PathBuf::from("."), entries: vec![entry.clone()] };
+        let mut pager = Pager::new("", "", None, Some(index), &cfg, &hl, None, false, TermTheme::Dark);
+        for query in ["", "fb", "fbr", "QC", "qcé", "fb qcé", "notes"] {
+            pager.index_filter = query.into();
+            assert!(pager.entry_matches(&entry), "should match {query:?}");
+            // A match inside the folder name keeps both the folder and document.
+            assert_eq!(pager.visible_rows().len(), 2, "query: {query:?}");
+        }
+        for query in ["bfq", "fff", "FB", "fb xyz", "éq"] {
+            pager.index_filter = query.into();
+            assert!(!pager.entry_matches(&entry), "should not match {query:?}");
+            assert!(pager.visible_rows().is_empty());
+        }
     }
 
     #[test]
