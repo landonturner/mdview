@@ -181,6 +181,11 @@ struct Pager<'a> {
     search: Option<Search>,
     message: Option<String>,
     quit: bool,
+    selection: Option<((usize, usize), (usize, usize))>,
+    mouse_down: Option<(usize, usize)>,
+    mouse_dragged: bool,
+    mouse_anchor: (usize, usize),
+    pending_copy: Option<String>,
 }
 
 impl<'a> Pager<'a> {
@@ -248,6 +253,11 @@ impl<'a> Pager<'a> {
             search: None,
             message: None,
             quit: false,
+            selection: None,
+            mouse_down: None,
+            mouse_dragged: false,
+            mouse_anchor: (0, 0),
+            pending_copy: None,
         };
         pager.rebuild_tree();
         pager
@@ -275,6 +285,8 @@ impl<'a> Pager<'a> {
         let old_len = self.lines().len().max(1);
         let frac = self.top as f64 / old_len as f64;
         self.diagrams = !self.diagrams;
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
         self.images_stale = true;
@@ -294,6 +306,8 @@ impl<'a> Pager<'a> {
         let old_len = self.lines().len().max(1);
         let frac = self.top as f64 / old_len as f64;
         self.wrap_tables = !self.wrap_tables;
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
         self.images_stale = true;
@@ -365,12 +379,18 @@ impl<'a> Pager<'a> {
                     }
                     Event::Mouse(m) => {
                         if self.mouse(m) {
-                            self.message = None;
                             changed = true;
                         }
                     }
                     _ => {}
                 }
+            }
+            if let Some(text) = self.pending_copy.take() {
+                self.message = Some(match copy_selection(&text) {
+                    Ok(()) => "Selection copied".into(),
+                    Err(err) => format!("Copy failed: {err}"),
+                });
+                changed = true;
             }
             if crate::diagram::take_dirty() | crate::images::take_dirty() {
                 // A diagram or image finished preparing: re-render at the
@@ -427,6 +447,8 @@ impl<'a> Pager<'a> {
             return false;
         }
         self.source = source;
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = self.top.min(self.max_top());
         self.research();
@@ -440,6 +462,8 @@ impl<'a> Pager<'a> {
         self.w = if w == 0 { 80 } else { w };
         self.h = if h == 0 { 24 } else { h };
         self.image_mode = detect_image_mode();
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = ((frac * self.lines().len() as f64) as usize).min(self.max_top());
         self.research();
@@ -511,6 +535,16 @@ impl<'a> Pager<'a> {
     fn key_normal(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let page = self.content_h() as i64;
+        if self.selection.is_some() && !self.selected_text().is_empty() {
+            if key.code == KeyCode::Char('y') || (ctrl && key.code == KeyCode::Char('c')) {
+                self.pending_copy = Some(self.selected_text());
+                return;
+            }
+            if key.code == KeyCode::Esc {
+                self.selection = None;
+                return;
+            }
+        }
         match key.code {
             KeyCode::Char(c @ '0'..='9') if !ctrl => {
                 self.count.push(c);
@@ -578,6 +612,18 @@ impl<'a> Pager<'a> {
     }
 
     fn key_prompt(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Down | KeyCode::Up => {
+                self.scroll(if key.code == KeyCode::Down { 1 } else { -1 });
+                return;
+            }
+            KeyCode::Char('j' | 'k') if ctrl => {
+                self.scroll(if key.code == KeyCode::Char('j') { 1 } else { -1 });
+                return;
+            }
+            _ => {}
+        }
         let Mode::Prompt { backward, buf } = &mut self.mode else { return };
         let backward = *backward;
         match key.code {
@@ -597,7 +643,7 @@ impl<'a> Pager<'a> {
                     self.do_search(query, backward);
                 }
             }
-            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Char(c) if !ctrl => buf.push(c),
             _ => {}
         }
     }
@@ -635,6 +681,8 @@ impl<'a> Pager<'a> {
     /// Returns to the directory list from a document opened out of it.
     fn show_index(&mut self) {
         self.source.clear();
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render("", self.hl, &self.render_opts());
         self.path = None;
         self.file_stamp = None;
@@ -738,6 +786,10 @@ impl<'a> Pager<'a> {
     fn key_index_prompt(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Down | KeyCode::Up => {
+                self.key_index(key);
+                return;
+            }
             KeyCode::Char('j' | 'k') if ctrl => {
                 self.key_index(key);
                 return;
@@ -798,6 +850,8 @@ impl<'a> Pager<'a> {
         self.path = Some(entry.path);
         self.resolve_links = true;
         self.back_stack.clear();
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = 0;
         self.search = None;
@@ -1003,6 +1057,44 @@ impl<'a> Pager<'a> {
     fn mouse(&mut self, m: MouseEvent) -> bool {
         let (col, row) = (m.column as usize, m.row as usize);
         let in_content = row < self.content_h();
+        // Delay activation until release so dragging a link selects its text.
+        if matches!(self.mode, Mode::Normal | Mode::Follow { .. } | Mode::Prompt { .. }) {
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) if in_content => {
+                    self.selection = None;
+                    self.mouse_down = Some((col, row));
+                    self.mouse_anchor = self.text_position(col, row);
+                    self.mouse_dragged = false;
+                    self.mode = Mode::Normal;
+                    return true;
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(start) = self.mouse_down {
+                        self.mouse_dragged |= start != (col, row);
+                        if self.mouse_dragged {
+                            self.selection = Some((self.mouse_anchor, self.text_position(col, row)));
+                        }
+                        return true;
+                    }
+                    return false;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(start) = self.mouse_down.take() {
+                        if self.mouse_dragged || start != (col, row) {
+                            self.selection = Some((self.mouse_anchor, self.text_position(col, row)));
+                            let text = self.selected_text();
+                            if !text.is_empty() {
+                                self.pending_copy = Some(text);
+                            }
+                            return true;
+                        }
+                        return in_content && self.click_content(col, row);
+                    }
+                    return false;
+                }
+                _ => {}
+            }
+        }
         match m.kind {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 let delta: i64 = if matches!(m.kind, MouseEventKind::ScrollDown) { 3 } else { -3 };
@@ -1040,16 +1132,32 @@ impl<'a> Pager<'a> {
                     }
                     true
                 }
-                Mode::Follow { .. } | Mode::Normal | Mode::Prompt { .. } => {
-                    if !in_content {
-                        return false;
-                    }
-                    self.mode = Mode::Normal;
-                    self.click_content(col, row)
-                }
+                Mode::Follow { .. } | Mode::Normal | Mode::Prompt { .. } => false,
             },
             _ => false,
         }
+    }
+
+    fn text_position(&self, col: usize, row: usize) -> (usize, usize) {
+        let idx = (self.top + row.min(self.content_h() - 1)).min(self.lines().len().saturating_sub(1));
+        let col = col.min(self.w as usize).saturating_sub(effective_margin(self.cfg, self.w) as usize);
+        let text = self.lines().get(idx).map(Line::plain).unwrap_or_default();
+        (idx, byte_at_column(&text, col))
+    }
+
+    fn selection_range(&self, idx: usize) -> Option<(usize, usize)> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        if idx < start.0 || idx > end.0 { return None; }
+        let len = self.lines().get(idx)?.plain().len();
+        Some((if idx == start.0 { start.1.min(len) } else { 0 },
+              if idx == end.0 { end.1.min(len) } else { len }))
+    }
+
+    fn selected_text(&self) -> String {
+        self.lines().iter().enumerate().filter_map(|(idx, line)| {
+            self.selection_range(idx).map(|(start, end)| line.plain()[start..end].to_string())
+        }).collect::<Vec<_>>().join("\n")
     }
 
     /// A left click at screen (col, row) inside the document: opens the
@@ -1224,6 +1332,8 @@ impl<'a> Pager<'a> {
         self.file_stamp = file_stamp(path);
         self.source = source;
         self.resolve_links = true; // navigated docs always have a real base
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = 0;
         self.search = None;
@@ -1248,6 +1358,8 @@ impl<'a> Pager<'a> {
         self.path = prev.path;
         self.base = prev.base;
         self.file_stamp = self.path.as_deref().and_then(file_stamp);
+        self.selection = None;
+        self.mouse_down = None;
         self.doc = render(&self.source, self.hl, &self.render_opts());
         self.top = prev.top.min(self.max_top());
         self.search = None;
@@ -1390,7 +1502,7 @@ impl<'a> Pager<'a> {
         let line = &self.lines()[idx];
         // Matches are sorted by line, so binary-search the slice for this row
         // instead of scanning every match per visible line per frame.
-        let ranges: Vec<(usize, usize)> = match &self.search {
+        let mut ranges: Vec<(usize, usize)> = match &self.search {
             Some(s) => {
                 let start = s.matches.partition_point(|m| m.0 < idx);
                 let end = s.matches.partition_point(|m| m.0 <= idx);
@@ -1398,6 +1510,11 @@ impl<'a> Pager<'a> {
             }
             None => Vec::new(),
         };
+
+        if let Some(range) = self.selection_range(idx) {
+            ranges.push(range);
+            ranges.sort_unstable();
+        }
 
         let max = (self.w - effective_margin(self.cfg, self.w)) as usize;
         let mut col = 0usize;
@@ -1549,9 +1666,10 @@ impl<'a> Pager<'a> {
             ("h", "collapse a folder / go to its parent (directory list)"),
             ("H / L", "collapse / expand all folders (directory list)"),
             ("/", "fuzzy-filter the directory list as you type"),
-            ("^j / ^k", "move down / up while filtering the directory list"),
+            ("↓ / ↑, ^j / ^k", "move down / up while searching or filtering"),
             ("?", "this help (directory list)"),
-            ("mouse", "click links, images, tree rows; wheel scrolls"),
+            ("mouse", "click links/images; wheel scrolls; drag selects/copies"),
+            ("y / Ctrl+C", "copy selection (Esc clears it)"),
             ("h", "this help"),
         ];
         let key_w = 14;
@@ -1641,6 +1759,35 @@ fn open_external(url: &str, message: &mut Option<String>) {
             *message = Some(format!("Opened {url}"));
         }
         Err(err) => *message = Some(format!("{opener}: {err}")),
+    }
+}
+
+fn byte_at_column(text: &str, column: usize) -> usize {
+    let mut col = 0;
+    for (byte, ch) in text.char_indices() {
+        let width = ch.width().unwrap_or(0);
+        if width > 0 && col + width > column { return byte; }
+        col += width;
+    }
+    text.len()
+}
+
+fn copy_selection(text: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped()).spawn()?;
+        child.stdin.take().unwrap().write_all(text.as_bytes())?;
+        if !child.wait()?.success() { return Err(io::Error::other("pbcopy failed")); }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let mut out = io::stdout();
+        write!(out, "\x1b]52;c;{encoded}\x07")?;
+        out.flush()
     }
 }
 
@@ -1858,6 +2005,80 @@ mod tests {
     }
 
     #[test]
+    fn drag_selects_link_text_without_activating_and_click_releases() {
+        let cfg = Config::default();
+        let hl = Highlighter::new("base16-ocean.dark");
+        let mut pager = Pager::new("[hello](#target) world\n\n# Target", "", None, None, &cfg, &hl, None, false, TermTheme::Dark);
+        pager.w = 80;
+        pager.h = 3;
+        let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        pager.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        assert_eq!(pager.top, 0);
+        pager.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 7, 0));
+        assert!(pager.pending_copy.is_none());
+        pager.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 7, 0));
+        assert_eq!(pager.pending_copy.take().as_deref(), Some("hello"));
+        assert_eq!(pager.selected_text(), "hello");
+        assert_eq!(pager.top, 0);
+        pager.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 7, 0));
+        pager.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        pager.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 0));
+        assert_eq!(pager.selected_text(), "hello");
+        assert_eq!(pager.pending_copy.take().as_deref(), Some("hello"));
+        // An empty drag must not overwrite the clipboard.
+        pager.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 1));
+        pager.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 7, 1));
+        pager.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 7, 1));
+        assert!(pager.pending_copy.is_none());
+        pager.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 2, 0));
+        assert!(pager.selection.is_none());
+        assert_eq!(pager.top, 0);
+        pager.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 2, 0));
+        assert!(pager.top > 0);
+        assert!(pager.pending_copy.is_none());
+    }
+
+    #[test]
+    fn search_prompt_navigation_preserves_query_and_mode() {
+        let cfg = Config::default();
+        let hl = Highlighter::new("base16-ocean.dark");
+        let mut pager = Pager::new("one\n\ntwo\n\nthree", "", None, None, &cfg, &hl, None, false, TermTheme::Dark);
+        pager.h = 3;
+        for backward in [false, true] {
+            for (down, up, modifiers) in [
+                (KeyCode::Down, KeyCode::Up, KeyModifiers::NONE),
+                (KeyCode::Char('j'), KeyCode::Char('k'), KeyModifiers::CONTROL),
+            ] {
+                pager.top = 0;
+                pager.mode = Mode::Prompt { backward, buf: "two".into() };
+                pager.key_prompt(KeyEvent::new(down, modifiers));
+                assert_eq!(pager.top, 1);
+                for _ in 0..10 { pager.key_prompt(KeyEvent::new(down, modifiers)); }
+                assert_eq!(pager.top, pager.max_top());
+                for _ in 0..10 { pager.key_prompt(KeyEvent::new(up, modifiers)); }
+                assert_eq!(pager.top, 0);
+                assert!(matches!(&pager.mode, Mode::Prompt { backward: b, buf } if *b == backward && buf == "two"));
+                pager.key_prompt(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+                pager.key_prompt(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+                assert!(matches!(&pager.mode, Mode::Prompt { buf, .. } if buf == "twojk"));
+            }
+        }
+    }
+
+    #[test]
+    fn selection_handles_unicode_multiline_and_reflow() {
+        let cfg = Config::default();
+        let hl = Highlighter::new("base16-ocean.dark");
+        let mut pager = Pager::new("a界éz\n\nsecond", "", None, None, &cfg, &hl, None, false, TermTheme::Dark);
+        assert_eq!(byte_at_column("a界éz", 2), 1);
+        assert_eq!(byte_at_column("a界éz", 4), "a界é".len());
+        pager.selection = Some(((2, 3), (0, 1)));
+        assert_eq!(pager.selected_text(), "界éz\n\nsec");
+        pager.resize(60, 24);
+        assert!(pager.selection.is_none());
+    }
+
+    #[test]
     fn directory_filter_navigation_preserves_query_and_selection() {
         let cfg = Config::default();
         let hl = Highlighter::new("base16-ocean.dark");
@@ -1879,6 +2100,12 @@ mod tests {
         let up = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
         pager.key_index_prompt(down);
         assert_eq!(pager.index_sel, 1);
+        pager.key_index_prompt(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(pager.index_sel, 2);
+        pager.key_index_prompt(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(pager.index_sel, 1);
+        assert_eq!(pager.index_filter, "doc");
+        assert!(matches!(pager.mode, Mode::IndexPrompt));
         for _ in 0..10 {
             pager.key_index_prompt(down);
         }

@@ -107,9 +107,8 @@ hot_reload = true
 # line per row, cut with …). Toggle in the pager with w.
 table_view = "wrap"
 
-# Mouse support: click links and images, click rows in the directory tree,
-# scroll with the wheel. With it on, select text by holding Shift while
-# dragging (most terminals); set false to leave the mouse to the terminal.
+# Click links/images/tree rows, scroll with the wheel, and drag to select text.
+# Selection copies automatically on release. Set false for terminal-native selection.
 mouse = true
 "#;
 

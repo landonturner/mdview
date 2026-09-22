@@ -51,7 +51,7 @@ alongside. `j`/`k` move, `Enter` or `l` expands a folder or opens a document,
 everything. `q` in an opened document brings you back to the tree; `q` on the
 tree quits. `/` fuzzy-filters as you type, matching characters in order in
 paths and titles (for example, `fb` matches `foobar`) and showing
-only the branches that match (`Ctrl+J`/`Ctrl+K` move the selection down/up
+only the branches that match (`↓`/`↑` or `Ctrl+J`/`Ctrl+K` move the selection down/up
 while filtering; `Enter` keeps the filter and selection and opens the
 document if only one is left; `Esc` clears it). The tree refreshes itself as
 files appear, so a folder an agent is filling with notes can be left open and
@@ -132,6 +132,7 @@ cargo build --release   # or: mise exec -- cargo build --release
 | `g` / `G`      | top / bottom (`42g` → line 42)      |
 | `50p`          | go to 50%                           |
 | `/` / `?`      | search forward / backward (smartcase substring) |
+| `↓` / `↑`, `Ctrl+J` / `Ctrl+K` | move down / up while the search or directory filter is active |
 | `n` / `N`      | next / previous match               |
 | `]` / `[`      | next / previous heading             |
 | `t`            | table of contents overlay           |
@@ -201,7 +202,7 @@ hot_reload = true
 # Long table cells: "wrap" onto extra lines, or "compact" (one line, cut with …).
 table_view = "wrap"
 
-# Click links/images/tree rows and scroll with the wheel (Shift-drag to select text).
+# Click links/images/tree rows, scroll, and drag to select and automatically copy.
 mouse = true
 ```
 
@@ -211,13 +212,15 @@ All keys are optional; `--width` overrides the file.
 nothing is cut off; `"compact"` keeps one line per row and trims overflow with
 `…`. Either way, `w` in the pager switches between the two.
 
-`mouse = true` (the default) lets you click a link to follow it (markdown
-links open inside mdview, web links in the browser), click an image to open it
-in your image viewer, click rows in the directory tree, and scroll with the
-wheel. While the mouse is captured, select text by holding Shift while
-dragging (Ghostty, kitty, iTerm2, WezTerm); set `mouse = false` to hand the
-mouse back to the terminal. Inside tmux, `set -g mouse on` is needed for
-clicks to reach the pane.
+`mouse = true` (the default) lets you click links, images, and directory-tree
+rows, scroll with the wheel, and drag to highlight document text. Clicks
+activate on release, so dragging across a link selects it without opening it.
+Releasing a drag automatically copies nonempty selected text to the clipboard.
+Press `y` or `Ctrl+C` to copy it again, and `Esc` to clear the highlight. Copy uses
+the system clipboard on macOS and OSC 52 on other platforms (terminal support
+required). The highlight belongs to mdview; terminal-native copy shortcuts do
+not copy it. Set `mouse = false` for terminal-native selection instead.
+Inside tmux, `set -g mouse on` is needed for clicks to reach the pane.
 
 `hot_reload = true` (the default) makes mdview re-read the file whenever it
 changes on disk and re-render in place, keeping your scroll position, so a
